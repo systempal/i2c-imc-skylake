@@ -1,0 +1,110 @@
+Subject: [PATCH 0/1] i2c: imc-skylake: add Intel Skylake-X iMC SMBus adapter
+
+This is v3 of the i2c-imc-skylake driver.  v2 was submitted under the name
+i2c-imc-x299; the driver has been renamed to reflect that the iMC SMBus
+engine is in the Skylake-X / Cascade Lake-X CPU, not in the X299 chipset.
+
+This series adds a driver for the integrated memory controller (iMC) SMBus
+engine on Intel Skylake-X / Cascade Lake-X processors (socket LGA 2066,
+platform X299, PCU function 8086:2085).
+
+The engine provides two SMBus channels — one per pair of DIMM slots — over
+which SPD EEPROMs, DDR4 thermal sensors and third-party LED controllers
+(e.g. ENE KB9012 at 0x27) are accessible.  Exposing it as a pair of standard
+Linux I2C adapters lets existing tools (i2c-tools, lm-sensors) use
+it without bespoke sysfs hacks.
+
+Why ECAM MMIO instead of pci_{read,write}_config_dword
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+On X299 the kernel selects "configuration type 1" (CF8/CFC port I/O) for PCI
+config space access, as reported by boot-time dmesg:
+
+  PCI: Using configuration type 1 for base access
+
+System Management Mode traps writes to those ports for this device, so a
+standard pci_write_config_dword() targeting the SMBus DATA register never
+reaches the hardware — the transaction hangs at status bit 0x08 indefinitely.
+The Windows NTIOLib (used by Kingston FURY) reaches the same registers via the
+ECAM (MMIO) window, which is not trapped.  This driver follows the same path:
+ioremap() of the ECAM page for the target function and driving the registers
+by MMIO read/write.
+
+Note that pci_mmcfg_* helpers are arch-internal and not exported to modules,
+so a manual walk of the ACPI MCFG table is used to locate mmcfg_base at probe
+time (no module parameter, no hardcoding).
+
+Relation to prior iMC SMBus work
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Two previous attempts to upstream an iMC SMBus driver exist:
+
+  - Lutomirski 2013–2016 (Sandy Bridge-EP 8086:3ca8): used CF8/CFC
+    pci_read/write_config_dword — correct on that platform since SMM does not
+    trap those ports on Sandy Bridge-EP.  Not merged due to missing bus
+    arbitration (BMC / CLTT sharing) and a required allow_unsafe_access flag.
+
+  - schaecsn 2020 (Broadwell-E 8086:6fa8): added TSOD arbitration using the
+    Broadwell-documented tsod_polling_interval quiesce procedure.  Not merged
+    (no reviewer response); register layout differs from X299.
+
+This driver is for a different device ID (0x2085), different register layout
+(DATA/STATUS/CTRL at 0x9C-0xB8 vs 0x180-0x188), and a fundamentally different
+access method (ECAM ioremap).  Combining it with the Lutomirski/schaecsn code
+would require a large per-generation hw_data table with mutually incompatible
+access methods; a separate file is cleaner.
+
+The X299 HEDT (High-End Desktop) platform has no BMC and no CLTT firmware
+polling, so the arbitration safety concern of the Lutomirski patch does not
+apply.  No allow_unsafe_access flag is needed.
+
+Independent validation
+~~~~~~~~~~~~~~~~~~~~~~
+The register layout (DATA/STATUS/CTRL at 0x9C-0xB8, stride 4, GO bit 19,
+WORD bit 17) was independently reverse-engineered and confirmed by the
+PawnIO.Modules project (SmbusIntelSkylakeIMC.p, Windows userspace, Feb 2026)
+and by commercial monitoring tools (HWiNFO, SIV) that access the same PCI
+config space via the Windows kernel API (ECAM by default on this platform).
+
+Changes since v2
+~~~~~~~~~~~~~~~~~
+  - Rename driver from i2c-imc-x299 to i2c-imc-skylake
+  - Fix iMC SMBus attribution: engine is in the CPU (Skylake-X), not
+    the X299 chipset
+  - Add I2C_SMBUS_WORD_DATA support (WORD_BIT bit 17) for TSOD reads
+  - Update adapter name: "iMC SMBus Skylake-X channel N"
+
+Testing
+~~~~~~~
+Tested on: Intel X299 platform (Skylake-X CPU), 4× DDR4 DIMMs,
+kernel 7.0.0-14-generic (Linux Mint 22.3).
+
+  $ i2cdetect -l | grep iMC
+  i2c-7   smbus   iMC SMBus Skylake-X channel 0   SMBus adapter
+  i2c-8   smbus   iMC SMBus Skylake-X channel 1   SMBus adapter
+
+The driver supports SMBus BYTE_DATA and WORD_DATA transfers.  WORD_DATA
+uses the engine's WORD_BIT (bit 17) and is needed for DDR4 thermal sensors
+(TSOD) which expose 16-bit temperature registers.  The engine stores word
+data in little-endian order in the CTRL register, so byte-swapping is applied
+on both read and write paths.
+
+Since the hardware requires a register offset for every transaction,
+I2C_SMBUS_QUICK and I2C_SMBUS_BYTE (which have no offset) are not supported
+(returning -EOPNOTSUPP).  Use `i2cdetect -r` (read byte data probe) to scan
+for devices.  Standard kernel drivers such as ee1004 (for DDR4 SPD) load
+and bind successfully via BYTE_DATA reads.
+
+udev autoloads the module on PCI add event (MODULE_DEVICE_TABLE present).
+20 rmmod/modprobe cycles: no oops, no warnings, no resource leaks in dmesg.
+
+Signed-off-by: Simone Chifari <simone.chifari@gmail.com>
+
+---
+
+Simone Chifari (1):
+  i2c: imc-skylake: add driver for Intel Skylake-X iMC SMBus engine
+
+ MAINTAINERS                         |    6 +
+ drivers/i2c/busses/Kconfig          |   19 +
+ drivers/i2c/busses/Makefile         |    1 +
+ drivers/i2c/busses/i2c-imc-skylake.c  |  512 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 538 insertions(+)

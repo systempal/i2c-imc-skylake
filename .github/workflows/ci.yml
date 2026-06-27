@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential linux-headers-$(uname -r)
+
+      - name: Build module
+        run: make
+
+      - name: Run checkpatch
+        run: |
+          curl -sSLo checkpatch.pl https://raw.githubusercontent.com/torvalds/linux/master/scripts/checkpatch.pl
+          curl -sSLo spelling.txt https://raw.githubusercontent.com/torvalds/linux/master/scripts/spelling.txt
+          perl checkpatch.pl --no-tree --strict --no-summary --show-types -f i2c-imc-skylake.c
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: i2c-imc-skylake-${{ github.ref_name }}
+          path: i2c-imc-skylake.ko
+          if-no-files-found: error
