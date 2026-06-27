@@ -38,6 +38,16 @@
  * ch1), hence two i2c_adapter instances exposed as separate /dev/i2c-* nodes.
  * Each channel carries the DIMM SPD EEPROMs (0x50-0x57) and thermal sensors -
  * all reachable by 7-bit address.
+ *
+ * Bus arbitration / concurrency with firmware:
+ *   The engine could in principle also be driven by SMM or by the iMC's own
+ *   closed-loop thermal throttling (CLTT) TSOD polling.  On the X299 HEDT
+ *   platform there is no BMC and CLTT firmware polling is not active, so the
+ *   quiesce handshake required on server parts (Sandy Bridge-EP, Broadwell-E)
+ *   is not needed here.  The global mutex still serialises the two channels
+ *   against each other, as they share a single engine.
+ *   TODO: read back the CLTT polling-interval register at probe to assert it
+ *   is disabled, rather than relying on the platform assumption.
  */
 
 #include <linux/acpi.h>
@@ -57,6 +67,10 @@
 #define PCU_ID		((PCU_DEVICE << 16) | PCI_VENDOR_ID_INTEL)
 
 #define CFG_SIZE	0x1000UL
+
+/* function-global config registers (offsets within the config page) */
+#define CFG_VENDOR_DEV	0x00	/* cfg[0]: vendor/device id, for ECAM sanity check */
+#define CFG_IMC_BUS	0xCC	/* cfg[0xCC] bits[15:8]: iMC SMBus bus number */
 
 /* per-channel register offsets within the config page */
 #define CH0_CTRL	0xB4
@@ -186,9 +200,9 @@ static int imc_wait(struct imc_smbus *s, const struct imc_chan *c, u32 *status)
  * Timeout: 50ms validated empirically across 5 X299 boards, 16 DIMM configs.
  * Worst-case observed: 12ms, margin 4x for SMM interference.
  *
- * Note: devm_ioremap() on x86 returns uncached (UC) mappings by default,
- * which enforce strong ordering. writel() includes a full mb() barrier,
- * ensuring the write is visible to hardware before polling begins.
+ * Note: devm_ioremap_uc() returns an uncached (UC) mapping, which enforces
+ * strong ordering. writel() includes a full mb() barrier, ensuring the write
+ * is visible to hardware before polling begins.
  */
 static int imc_wait_status(struct imc_smbus *s, const struct imc_chan *c)
 {
@@ -268,10 +282,16 @@ static int imc_read_byte(struct imc_smbus *s, const struct imc_chan *c,
 }
 
 /*
- * SMBus write-word to addr: latch the byte-swapped 16-bit value into CTRL,
- * then issue the command with WORD_BIT set.  The engine stores word data in
- * little-endian order in the CTRL register (low byte in bits[23:16], high
- * byte in bits[31:24]), so we swap before writing to match hardware layout.
+ * SMBus write-word to addr: latch the 16-bit value into CTRL[31:16], then
+ * issue the command with WORD_BIT set.  The value is byte-swapped between host
+ * order and the engine's CTRL byte layout (swab16) so that data->word follows
+ * the standard SMBus convention (low data byte first).  The read path applies
+ * the inverse swap.
+ *
+ * Validated on hardware: a WORD read returns the same byte order as two
+ * consecutive BYTE_DATA reads (word low byte == register R, high byte == R+1),
+ * confirmed against DDR4 SPD bytes.  This is exactly the convention jc42 relies
+ * on via i2c_smbus_read_word_swapped(), so no double swap occurs.
  */
 static int imc_write_word(struct imc_smbus *s, const struct imc_chan *c,
 			  u8 addr, u8 reg, u16 val)
@@ -279,7 +299,7 @@ static int imc_write_word(struct imc_smbus *s, const struct imc_chan *c,
 	u32 status = 0;
 	int ret;
 
-	/* byte-swap for little-endian hardware: low byte → bits[23:16] */
+	/* host order -> engine CTRL byte order (see function comment) */
 	writel((u32)swab16(val) << 16, s->cfg + c->ctrl);
 	ret = imc_wait_status(s, c);
 	if (ret)
@@ -297,10 +317,9 @@ static int imc_write_word(struct imc_smbus *s, const struct imc_chan *c,
 }
 
 /*
- * SMBus read-word from addr: issue the command with WORD_BIT set, return
- * the byte-swapped 16-bit value from CTRL.  The engine returns word data
- * in little-endian order (low byte in bits[23:16], high byte in bits[31:24]),
- * so we swap after reading to match CPU endianness.
+ * SMBus read-word from addr: issue the command with WORD_BIT set, return the
+ * 16-bit value from CTRL[15:0] byte-swapped back to host order (inverse of the
+ * write path).  See imc_write_word() for the byte-order convention.
  */
 static int imc_read_word(struct imc_smbus *s, const struct imc_chan *c,
 			 u8 addr, u8 reg, u16 *val)
@@ -365,7 +384,7 @@ static s32 imc_smbus_xfer(struct i2c_adapter *adap, u16 addr,
 		}
 	} else {
 		if (size == I2C_SMBUS_WORD_DATA) {
-			u16 wval;
+			u16 wval = 0;
 
 			ret = imc_read_word(s, c, addr, reg, &wval);
 			if (!ret)
@@ -449,13 +468,13 @@ static int imc_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	 * -EBUSY.  The pci_driver binding keeps the function alive; the registers
 	 * we drive are side-band controls the kernel does not otherwise touch.
 	 */
-	s->cfg = devm_ioremap(&pdev->dev, phys, CFG_SIZE);
+	s->cfg = devm_ioremap_uc(&pdev->dev, phys, CFG_SIZE);
 	if (!s->cfg) {
 		dev_err(&pdev->dev, "ioremap(%pa) failed\n", &phys);
 		return -ENOMEM;
 	}
 
-	cfg0 = readl(s->cfg + 0);
+	cfg0 = readl(s->cfg + CFG_VENDOR_DEV);
 	if (cfg0 != PCU_ID) {
 		dev_err(&pdev->dev, "wrong device at ECAM %pa (cfg[0]=0x%08x)\n",
 			&phys, cfg0);
@@ -470,7 +489,7 @@ static int imc_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	 * A mismatch means the ECAM walk landed on the wrong slot — warn but
 	 * continue; the binding is already locked to 8086:2085.
 	 */
-	cc = readl(s->cfg + 0xCC);
+	cc = readl(s->cfg + CFG_IMC_BUS);
 	imc_bus_hw = (cc >> 8) & 0xFF;
 
 	if (imc_bus_hw && imc_bus_hw != (u8)pdev->bus->number)
@@ -490,7 +509,7 @@ static int imc_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	 * devm_i2c_add_adapter(), the adapter is automatically removed on
 	 * driver detach, and no concurrent xfer can be in flight at that point.
 	 */
-	for (i = 0; i < 2; i++) {
+	for (i = 0; i < ARRAY_SIZE(s->adap); i++) {
 		struct i2c_adapter *a = &s->adap[i];
 		int n;
 
@@ -540,4 +559,3 @@ module_pci_driver(imc_driver);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Simone Chifari");
 MODULE_DESCRIPTION("Intel Skylake-X iMC SMBus I2C adapter (ECAM MMIO)");
-MODULE_VERSION("1.0");
