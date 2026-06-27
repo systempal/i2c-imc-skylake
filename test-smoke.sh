@@ -32,13 +32,25 @@ else
 	_fail "ch1 adapter not found"
 fi
 
+# The engine has no QUICK/BYTE primitive, so `i2cdetect` cannot scan the bus
+# ("Bus doesn't support detection commands"). Probe SPD addresses directly with
+# a byte-data read of register 0x00 instead.
+_scan_spd() {
+	local bus=$1 found=""
+	echo "--- SPD scan bus $bus (byte-data read of reg 0x00) ---"
+	for a in 0x50 0x51 0x52 0x53 0x54 0x55 0x56 0x57; do
+		if v=$(i2cget -y "$bus" "$a" 0x00 2>/dev/null); then
+			echo "  $a present (reg0=$v)"
+			found="$a"
+		fi
+	done
+	[ -n "$found" ]
+}
+
 if [ -n "$CH0" ]; then
 	echo ""
-	echo "=== SPD scan ch0 (expect 0x50-0x57) ==="
-	i2cdetect -r -y "$CH0" 2>/dev/null
-	# at least one SPD slot must respond
-	if i2cdetect -r -y "$CH0" 2>/dev/null | grep '50' >/dev/null; then
-		_ok "SPD device at 0x50 on ch0"
+	if _scan_spd "$CH0"; then
+		_ok "SPD device present on ch0"
 	else
 		_fail "no SPD device on ch0"
 	fi
@@ -46,8 +58,7 @@ fi
 
 if [ -n "$CH1" ]; then
 	echo ""
-	echo "=== SPD scan ch1 ==="
-	i2cdetect -r -y "$CH1" 2>/dev/null
+	_scan_spd "$CH1" && _ok "SPD device present on ch1" || true
 fi
 
 echo ""

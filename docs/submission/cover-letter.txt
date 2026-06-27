@@ -89,8 +89,9 @@ on both read and write paths.
 
 Since the hardware requires a register offset for every transaction,
 I2C_SMBUS_QUICK and I2C_SMBUS_BYTE (which have no offset) are not supported
-(returning -EOPNOTSUPP).  Use `i2cdetect -r` (read byte data probe) to scan
-for devices.  Standard kernel drivers such as ee1004 (for DDR4 SPD) load
+(returning -EOPNOTSUPP).  For the same reason i2cdetect cannot scan the bus;
+access a device directly with a byte-data read, e.g. `i2cget -y <bus> 0x50 0x02`
+reads SPD byte 2.  Standard kernel drivers such as ee1004 (for DDR4 SPD) load
 and bind successfully via BYTE_DATA reads.
 
 udev autoloads the module on PCI add event (MODULE_DEVICE_TABLE present).

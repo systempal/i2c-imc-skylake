@@ -111,9 +111,9 @@ i2c-6   smbus           iMC SMBus Skylake-X channel 0                SMBus adapt
 i2c-7   smbus           iMC SMBus Skylake-X channel 1                SMBus adapter
 ```
 
-You can scan for SPD EEPROMs (usually located at addresses `0x50-0x57`) on channel 0:
+The engine has no SMBus QUICK/BYTE primitive, so `i2cdetect` cannot scan the bus. Read a device directly with a byte-data access (a register offset is always required), e.g. SPD byte 2 (DDR4 type code `0x0c`) from the EEPROM at `0x50` on channel 0:
 ```bash
-sudo i2cdetect -y 6
+sudo i2cget -y 6 0x50 0x02
 ```
 
 ---

@@ -43,11 +43,12 @@ patches/
 
 # Internal working documents (not for public repo)
 TODO.md
-submission-analysis.md
+docs/archive-submission-analysis.md
 README.local.md
 AGENTS.md
 docs/mainline-plan.md
 docs/archive-i2c-imc-driver-plan.md
+docs/archive-v3-review-fixes.md
 docs/submission/submission-instructions.md
 
 # Private Gitea CI (replaced by .github/workflows/ for public repo)
