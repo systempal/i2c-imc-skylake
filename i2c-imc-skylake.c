@@ -355,10 +355,38 @@ static s32 imc_smbus_xfer(struct i2c_adapter *adap, u16 addr,
 	if (addr > 0x7f)
 		return -EINVAL;
 
-	if (size != I2C_SMBUS_BYTE_DATA && size != I2C_SMBUS_WORD_DATA)
+	/*
+	 * Emulate I2C_SMBUS_QUICK as a read-byte from offset 0.
+	 * This allows i2cdetect to probe devices without sending data.
+	 */
+	if (size == I2C_SMBUS_QUICK) {
+		mutex_lock(&s->lock);
+		ret = imc_read_byte(s, c, addr, 0, &val);
+		mutex_unlock(&s->lock);
+		return ret;
+	}
+
+	if (size != I2C_SMBUS_BYTE && size != I2C_SMBUS_BYTE_DATA &&
+	    size != I2C_SMBUS_WORD_DATA)
 		return -EOPNOTSUPP;
 
-	reg = command;
+	/*
+	 * Every transaction on this engine carries a register/offset byte.  For
+	 * BYTE_DATA the SMBus "command" is that register; for plain BYTE there
+	 * is no register phase, so offset 0 is used (read = receive-byte;
+	 * write = the command byte is the value written to offset 0).
+	 */
+	switch (size) {
+	case I2C_SMBUS_BYTE:
+		reg = (read_write == I2C_SMBUS_WRITE) ? 0 : command;
+		break;
+	case I2C_SMBUS_BYTE_DATA:
+	case I2C_SMBUS_WORD_DATA:
+		reg = command;
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
 
 	mutex_lock(&s->lock);
 	if (read_write == I2C_SMBUS_WRITE) {
@@ -367,7 +395,7 @@ static s32 imc_smbus_xfer(struct i2c_adapter *adap, u16 addr,
 				c->idx, addr, reg, data->word);
 			ret = imc_write_word(s, c, addr, reg, data->word);
 		} else {
-			val = data->byte;
+			val = (size == I2C_SMBUS_BYTE) ? command : data->byte;
 			dev_dbg(s->dev, "ch%d W addr=%02x reg=%02x val=%02x\n",
 				c->idx, addr, reg, val);
 			ret = imc_write_byte(s, c, addr, reg, val);
@@ -396,7 +424,8 @@ static s32 imc_smbus_xfer(struct i2c_adapter *adap, u16 addr,
 
 static u32 imc_func(struct i2c_adapter *adap)
 {
-	return I2C_FUNC_SMBUS_BYTE_DATA | I2C_FUNC_SMBUS_WORD_DATA;
+	return I2C_FUNC_SMBUS_QUICK | I2C_FUNC_SMBUS_BYTE |
+	       I2C_FUNC_SMBUS_BYTE_DATA | I2C_FUNC_SMBUS_WORD_DATA;
 }
 
 static const struct i2c_algorithm imc_algo = {
