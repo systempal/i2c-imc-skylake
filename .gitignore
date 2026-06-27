@@ -1,0 +1,54 @@
+# Kernel build artifacts & temporary files
+*.ko
+*.ko.zst
+*.mod
+*.mod.c
+*.mod.o
+*.o
+*.a
+*.s
+.*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+/i2c-imc-skylake.mod
+
+# C/C++ Developer tools and symbol databases
+*.d
+*.o.d
+compile_commands.json
+.clangd/
+.cache/
+tags
+TAGS
+GPATH
+GRTAGS
+GSYMS
+GTAGS
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.code-workspace
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Generated patch files (git format-patch output)
+patches/
+
+# Internal working documents (not for public repo)
+TODO.md
+submission-analysis.md
+README.local.md
+AGENTS.md
+docs/mainline-plan.md
+docs/archive-i2c-imc-driver-plan.md
+docs/submission/submission-instructions.md
+
+# Private Gitea CI (replaced by .github/workflows/ for public repo)
+.gitea/
