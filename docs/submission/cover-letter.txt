@@ -1,4 +1,4 @@
-Subject: [PATCH 0/1] i2c: imc-skylake: add Intel Skylake-X iMC SMBus adapter
+Subject: [PATCH v3 0/1] i2c: imc-skylake: add Intel Skylake-X iMC SMBus adapter
 
 This is v3 of the i2c-imc-skylake driver.  v2 was submitted under the name
 i2c-imc-x299; the driver has been renamed to reflect that the iMC SMBus
@@ -23,7 +23,8 @@ config space access, as reported by boot-time dmesg:
 
 System Management Mode traps writes to those ports for this device, so a
 standard pci_write_config_dword() targeting the SMBus DATA register never
-reaches the hardware — the transaction hangs at status bit 0x08 indefinitely.
+reaches the hardware — the GO bit never clears and the transaction never
+completes.
 The Windows NTIOLib (used by Kingston FURY) reaches the same registers via the
 ECAM (MMIO) window, which is not trapped.  This driver follows the same path:
 ioremap() of the ECAM page for the target function and driving the registers
@@ -71,6 +72,16 @@ Changes since v2
     the X299 chipset
   - Add I2C_SMBUS_WORD_DATA support (WORD_BIT bit 17) for TSOD reads
   - Update adapter name: "iMC SMBus Skylake-X channel N"
+  - Use devm_ioremap_uc() for the ECAM mapping (uncached, strongly
+    ordered) instead of devm_ioremap()
+  - Use ARRAY_SIZE() for the adapter loop; initialise wval on the
+    word-read path
+  - Build FRAME from named bits (ENGINE_ENABLE | GO_BIT) instead of a
+    magic constant; document the CTRL/DATA/STATUS encoding in full
+  - Cross-check the iMC bus number against cfg[0xCC] at probe
+  - Kconfig: depends on PCI && ACPI && (X86_64 || COMPILE_TEST); drop
+    the CONFIG_ACPI fallback stub accordingly
+  - Quiet probe: demote informational probe messages to dev_dbg()
 
 Testing
 ~~~~~~~
@@ -97,15 +108,13 @@ and bind successfully via BYTE_DATA reads.
 udev autoloads the module on PCI add event (MODULE_DEVICE_TABLE present).
 20 rmmod/modprobe cycles: no oops, no warnings, no resource leaks in dmesg.
 
-Signed-off-by: Simone Chifari <simone.chifari@gmail.com>
-
 ---
 
 Simone Chifari (1):
   i2c: imc-skylake: add driver for Intel Skylake-X iMC SMBus engine
 
- MAINTAINERS                         |    6 +
- drivers/i2c/busses/Kconfig          |   19 +
- drivers/i2c/busses/Makefile         |    1 +
- drivers/i2c/busses/i2c-imc-skylake.c  |  512 +++++++++++++++++++++++++++++++++++
- 4 files changed, 538 insertions(+)
+ MAINTAINERS                          |    6 +
+ drivers/i2c/busses/Kconfig           |   19 +
+ drivers/i2c/busses/Makefile          |    1 +
+ drivers/i2c/busses/i2c-imc-skylake.c |  551 +++++++++++++++++++++++++++++++++
+ 4 files changed, 577 insertions(+)

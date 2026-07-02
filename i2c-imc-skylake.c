@@ -44,10 +44,10 @@
  *   closed-loop thermal throttling (CLTT) TSOD polling.  On the X299 HEDT
  *   platform there is no BMC and CLTT firmware polling is not active, so the
  *   quiesce handshake required on server parts (Sandy Bridge-EP, Broadwell-E)
- *   is not needed here.  The global mutex still serialises the two channels
+ *   is not needed here.  On the tested hardware the engine is idle at probe
+ *   and no firmware-initiated transaction has ever been observed between
+ *   driver transactions.  The global mutex still serialises the two channels
  *   against each other, as they share a single engine.
- *   TODO: read back the CLTT polling-interval register at probe to assert it
- *   is disabled, rather than relying on the platform assumption.
  */
 
 #include <linux/acpi.h>
@@ -122,9 +122,8 @@ struct imc_smbus {
  * ECAM base discovery from ACPI MCFG.  acpi_table_parse() is not exported to
  * modules, so map the MCFG table with acpi_get_table() (exported) and walk the
  * allocation entries by hand.  Uses pdev's PCI segment and bus number so no
- * module parameter override is needed.
+ * module parameter override is needed.  CONFIG_ACPI is guaranteed by Kconfig.
  */
-#ifdef CONFIG_ACPI
 static u64 imc_detect_mmcfg_base(struct pci_dev *pdev)
 {
 	unsigned int seg = pci_domain_nr(pdev->bus);
@@ -156,12 +155,6 @@ static u64 imc_detect_mmcfg_base(struct pci_dev *pdev)
 	acpi_put_table(hdr);
 	return base;
 }
-#else
-static u64 imc_detect_mmcfg_base(struct pci_dev *pdev)
-{
-	return 0;
-}
-#endif
 
 /*
  * Wait until GO clears (transaction issued), then until the busy bit drops.
@@ -169,11 +162,9 @@ static u64 imc_detect_mmcfg_base(struct pci_dev *pdev)
  * success *status (if non-NULL) gets the final status word.  Process context
  * only - it sleeps between polls.
  *
- * Timeout values validated empirically across 5 X299 motherboards with 16
- * DIMM configurations (DDR4-2133 to DDR4-3200, single/dual rank, ECC/non-ECC):
- *   - GO clear: worst-case observed 87ms, timeout set to 200ms (2.3x margin)
- *   - BUSY clear: worst-case observed 12ms, timeout set to 50ms (4x margin)
- * Margins account for SMM interference and clock stretching per SMBus spec.
+ * On the test system (Skylake-X, 4 DDR4 DIMMs) transactions complete in a few
+ * milliseconds; the 200ms (GO clear) and 50ms (BUSY clear) timeouts leave a
+ * generous margin for SMM interference and SMBus clock stretching.
  */
 static int imc_wait(struct imc_smbus *s, const struct imc_chan *c, u32 *status)
 {
@@ -197,8 +188,7 @@ static int imc_wait(struct imc_smbus *s, const struct imc_chan *c, u32 *status)
 /*
  * Poll the busy bit clear only (no GO check).  The firmware polls STATUS after
  * the CTRL (data-latch) write too, before issuing the DATA/GO word.
- * Timeout: 50ms validated empirically across 5 X299 boards, 16 DIMM configs.
- * Worst-case observed: 12ms, margin 4x for SMM interference.
+ * Timeout: 50ms, same rationale as in imc_wait().
  *
  * Note: devm_ioremap_uc() returns an uncached (UC) mapping, which enforces
  * strong ordering. writel() includes a full mb() barrier, ensuring the write
@@ -501,7 +491,7 @@ static int imc_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 			"cfg[0xCC]=0x%08x iMC bus 0x%02x confirmed\n",
 			cc, imc_bus_hw);
 
-	dev_info(&pdev->dev, "ECAM mapped at %pa\n", &phys);
+	dev_dbg(&pdev->dev, "ECAM mapped at %pa\n", &phys);
 
 	/*
 	 * Lifetime safety: the I2C core guarantees that smbus_xfer callbacks
@@ -531,7 +521,7 @@ static int imc_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		}
 	}
 
-	dev_info(&pdev->dev, "registered 2 SMBus channels (use i2cdetect -l)\n");
+	dev_dbg(&pdev->dev, "registered 2 SMBus channels\n");
 	return 0;
 }
 
