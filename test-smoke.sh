@@ -19,7 +19,23 @@ else
 	fi
 fi
 
-MODULE_PATH=${MODULE_PATH:-$(modinfo -n i2c-imc-skylake)}
+# Prefer the module built in this directory. Falling straight through to
+# modinfo would silently test whichever build is installed, which on a machine
+# with a DKMS package is not the one just compiled.
+_default_module()
+{
+	local local_build
+
+	local_build=$(dirname "$(readlink -f "$0")")/i2c-imc-skylake.ko
+	if [[ -r "$local_build" ]]; then
+		printf '%s\n' "$local_build"
+	else
+		modinfo -n i2c-imc-skylake
+	fi
+}
+
+MODULE_PATH=${MODULE_PATH:-$(_default_module)}
+echo "testing module: $MODULE_PATH"
 if [[ ! -r "$MODULE_PATH" ]]; then
 	echo "Module not found: $MODULE_PATH" >&2
 	exit 2
@@ -118,6 +134,46 @@ _word_test()
 	((word == expected))
 }
 
+# SMBus Receive Byte reads from the device's own pointer, so on an EEPROM a
+# sequence of them walks forward through the array. Prime the pointer with an
+# ordinary read, then check the next reads reproduce an ordinary dump of the
+# following bytes. A transaction that still named a register would return the
+# same byte every time.
+_receive_byte_test()
+{
+	local bus=$1 address=$2
+	local offset expected got
+
+	"${SUDO[@]}" i2cget -y "$bus" "$address" 0x00 >/dev/null 2>&1 || return 1
+	for offset in 0x01 0x02 0x03 0x04; do
+		got=$("${SUDO[@]}" i2cget -y "$bus" "$address" 2>/dev/null) || return 1
+		expected=$("${SUDO[@]}" i2cget -y "$bus" "$address" "$offset" 2>/dev/null) || return 1
+		((got == expected)) || return 1
+		# The explicit read above moved the pointer to $offset + 1, which
+		# is where the next Receive Byte should pick up.
+	done
+}
+
+# SMBus Send Byte against the DDR4 page-select addresses. Selecting page 1 puts
+# the upper half of the SPD in the 256-byte window, so byte 0x00 stops being
+# the JEDEC 0x23; selecting page 0 brings it back. The page state is the
+# readout, so the test verifies itself, and it ends on page 0 either way.
+_send_byte_test()
+{
+	local bus=$1 address=$2
+	local base flipped restored
+
+	base=$("${SUDO[@]}" i2cget -y "$bus" "$address" 0x00 2>/dev/null) || return 1
+
+	"${SUDO[@]}" i2cset -y "$bus" 0x37 0x00 c 2>/dev/null
+	flipped=$("${SUDO[@]}" i2cget -y "$bus" "$address" 0x00 2>/dev/null)
+
+	"${SUDO[@]}" i2cset -y "$bus" 0x36 0x00 c 2>/dev/null
+	restored=$("${SUDO[@]}" i2cget -y "$bus" "$address" 0x00 2>/dev/null)
+
+	[[ "$flipped" != "$base" && "$restored" == "$base" ]]
+}
+
 _nack_test()
 {
 	local bus=$1
@@ -168,6 +224,26 @@ fi
 if [[ -n "$CH1_ADDR" ]]; then
 	_word_test "$CH1" "$CH1_ADDR" && _ok "WORD_DATA byte order on ch1" || _fail "WORD_DATA test on ch1"
 
+fi
+if [[ -n "$CH0_ADDR" ]]; then
+	_receive_byte_test "$CH0" "$CH0_ADDR" &&
+		_ok "Receive Byte follows the EEPROM pointer on ch0" ||
+		_fail "Receive Byte test on ch0"
+fi
+if [[ -n "$CH1_ADDR" ]]; then
+	_receive_byte_test "$CH1" "$CH1_ADDR" &&
+		_ok "Receive Byte follows the EEPROM pointer on ch1" ||
+		_fail "Receive Byte test on ch1"
+fi
+if [[ -n "$CH0_ADDR" ]]; then
+	_send_byte_test "$CH0" "$CH0_ADDR" &&
+		_ok "Send Byte selects the SPD page on ch0" ||
+		_fail "Send Byte test on ch0"
+fi
+if [[ -n "$CH1_ADDR" ]]; then
+	_send_byte_test "$CH1" "$CH1_ADDR" &&
+		_ok "Send Byte selects the SPD page on ch1" ||
+		_fail "Send Byte test on ch1"
 fi
 if [[ -n "$CH0" ]]; then
 	_nack_test "$CH0" && _ok "absent-device ENXIO on ch0" || _fail "expected ENXIO at address 0x77 on ch0"

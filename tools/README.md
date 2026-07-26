@@ -64,3 +64,72 @@ Two results matter:
 
 Requirements: `msr-tools` (`rdmsr`), `pciutils` (`setpci`, `lspci`), and the
 `msr` module (`modprobe msr`).
+
+## 4. `probe-cf8-transaction.sh` — does CF8/CFC start a transfer? (WRITES TO HARDWARE)
+
+Follow-up to §3. `probe-cf8-write.sh` shows whether the register accepts a
+value; this shows whether the engine acts on it, by setting the GO bit for a
+read of an unpopulated address and watching STATUS.
+
+```bash
+sudo ./tools/probe-cf8-transaction.sh --i-understand
+```
+
+It does start one. That result retired the plan to reach these registers
+through ECAM with a PCI-core change, and the driver uses the ordinary config
+accessors.
+
+## 5. `probe-imc-documented.sh` — the interface Intel documents (WRITES TO HARDWARE)
+
+Issues a read through `SMB_STAT`/`SMBCMD`/`SMBCNTL` on the iMC channel
+functions (`8086:2040`), the interface the datasheet describes, rather than the
+PCU registers this driver uses.
+
+```bash
+sudo ./tools/probe-imc-documented.sh --i-understand
+```
+
+On the development board it reports `RDO=1, SBE=0, RDATA=0x00` identically for
+a populated 0x50, a populated 0x52 and an absent 0x57: it completes but cannot
+tell a populated slot from an empty one, so it is not reaching this bus.
+
+## 6. `probe-pntr-sel.sh` — find the address-only bit (read-only on the bus)
+
+Finds the command-word bit that suppresses the register byte, which is what
+SMBus Receive Byte and Send Byte need.
+
+```bash
+sudo ./tools/probe-pntr-sel.sh --i-understand --channel 1
+```
+
+Not a blind sweep. An EEPROM auto-increments its pointer after a read, so
+priming the pointer with an ordinary read and then repeating it with the
+candidate bit set has a predicted answer: the *next* byte, not the one named.
+The script checks that prediction at two different offsets and then walks eight
+consecutive reads, which an ordinary dump must reproduce exactly.
+
+The answer on this engine is bit 18, matching the position of `PNTR_SEL`
+relative to `WORD_ACCESS` in the documented `SMBCMD` layout. Reads only, and
+never to the page-select addresses, so the DDR4 page latch does not move.
+
+## 7. `probe-send-byte.sh` — the write half (WRITES TO HARDWARE)
+
+Confirms the same bit produces a Send Byte, against the page-select addresses
+`0x36`/`0x37`. Those hold a latch and store no data, so the only thing a write
+there can do is choose which half of the SPD is visible — and that choice is
+itself the readout, since byte 0x00 is the JEDEC `0x23` on page 0 and something
+else on page 1. Nothing is written to `0x50`-`0x57`.
+
+```bash
+sudo ./tools/probe-send-byte.sh --i-understand --channel 0 --restore
+```
+
+`--restore` is the safe first run: it targets a channel already stuck on page 1
+and selects page 0, so a working Send Byte repairs that channel and a broken one
+leaves it exactly as found. There is no outcome worse than the starting state.
+`--flip` does the full round trip on a healthy channel, after `--restore` has
+shown the encoding works.
+
+A channel found on page 1 is not a fault of this driver: `ee1004`, and
+OpenRGB's `DDR4DirectAccessor::set_page()`, both select a page and leave it
+selected.
