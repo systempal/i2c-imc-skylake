@@ -73,7 +73,7 @@ probe_one()
 {
 	local bdf=$1 ch=$2
 	local stat=${SMB_STAT[ch]} cmd=${SMB_CMD[ch]} cntl=${SMB_CNTL[ch]}
-	local cntl_val stat_val cmd_saved command i data
+	local cntl_val stat_val cmd_saved command data
 
 	cntl_val=$(read_reg "$bdf" "$cntl")
 	stat_val=$(read_reg "$bdf" "$stat")
@@ -96,7 +96,7 @@ probe_one()
 	printf '  issuing SMBCMD=0x%08x (read SA=%d BA=%s)\n' "$command" "$SA" "$BA"
 	setpci -s "$bdf" "$cmd.L=$(printf '%08x' "$command")"
 
-	for i in $(seq 1 50); do
+	for _ in $(seq 1 50); do
 		stat_val=$(read_reg "$bdf" "$stat")
 		((stat_val & STAT_BUSY)) || break
 		sleep 0.005

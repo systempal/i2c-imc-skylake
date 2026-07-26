@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 #
-# WRITES TO HARDWARE. Settles the question patch 1/2 of the series exists for:
-# does a command written through CF8/CFC actually start an SMBus transaction,
-# or only land in the register?
+# WRITES TO HARDWARE. Answers the question that decided this driver's config
+# access method: does a command written through CF8/CFC actually start an SMBus
+# transaction, or only land in the register?
+#
+# It does start one. That result retired an earlier plan to reach the registers
+# through ECAM with a PCI-core change; the driver uses the ordinary config
+# accessors instead. Kept so anyone can reproduce it on their own board.
 #
 # tools/probe-cf8-write.sh already showed that the register itself is writable
 # through CF8/CFC. This issues a full command with the GO bit set and watches
@@ -23,8 +27,6 @@ GO_BIT=$((1 << 19))
 TSOD_ACTIVE_BIT=$((1 << 20))
 STAT_BUSY=1
 STAT_ERROR=2
-STAT_READ_DONE=4
-STAT_WRITE_DONE=8
 
 ADDR=0x77
 REG=0x00
@@ -134,18 +136,17 @@ if [[ "$final_status" != "$status0" ]]; then
 	cat <<-EOF
 	CF8/CFC STARTED A TRANSACTION.
 	STATUS moved from $status0 to $final_status without any ECAM access.
-	The premise of the ECAM patch does not hold: the driver can use
-	pci_read_config_dword() and pci_write_config_dword() like any other
-	driver, and patch 1/2 of the series is unnecessary.
+	No ECAM access is needed: the driver can use pci_read_config_dword()
+	and pci_write_config_dword() like any other driver. This is the
+	result the current driver is built on.
 	EOF
 else
 	cat <<-EOF
 	NO TRANSACTION.
 	The register accepted the write (probe-cf8-write.sh proved that) but the
-	engine did not act on it: STATUS never moved from $status0. This is the
-	evidence patch 1/2 needs - the failure is not a filtered write, it is a
-	command the engine ignores when it arrives this way.
-	Re-run the same command through the driver's ECAM path to complete the
-	comparison.
+	engine did not act on it: STATUS never moved from $status0. On this board
+	the failure would not be a filtered write but a command the engine
+	ignores when it arrives this way, and the driver's assumption that the
+	ordinary config accessors are enough would not hold here.
 	EOF
 fi
