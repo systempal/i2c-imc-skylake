@@ -23,43 +23,37 @@ env:
 
 jobs:
   out-of-tree:
-    name: Out-of-tree (${{ matrix.compiler }})
+    name: Out-of-tree build
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - compiler: gcc
-            make_args: ""
-          - compiler: clang
-            make_args: LLVM=1
 
+    # GCC only, deliberately. Building a module with LLVM=1 against the
+    # runner's distro headers fails before it reaches this source: those
+    # headers were built with GCC and their Makefiles pass flags clang does
+    # not accept (-fconserve-stack, -fsanitize=bounds-strict, -mrecord-mcount).
+    # Clang coverage belongs in the in-tree job below, which controls the
+    # whole kernel build.
     steps:
       - uses: actions/checkout@v4
 
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential clang llvm linux-headers-$(uname -r)
+          sudo apt-get install -y build-essential linux-headers-$(uname -r) shellcheck
 
       - name: Build module
-        run: make W=1 KCFLAGS=-W ${{ matrix.make_args }}
+        run: make W=1 KCFLAGS=-W
 
       - name: Run checkpatch
-        if: matrix.compiler == 'gcc'
         run: make checkpatch
 
       - name: Check shell scripts
-        if: matrix.compiler == 'gcc'
         run: |
-          sudo apt-get install -y shellcheck
           bash -n test-smoke.sh
           for f in tools/*.sh; do bash -n "$f"; done
           shellcheck -S warning test-smoke.sh tools/*.sh
 
       - name: Upload artifact
-        if: matrix.compiler == 'gcc'
         uses: actions/upload-artifact@v4
         with:
           name: i2c-imc-skylake-${{ github.ref_name }}
@@ -77,7 +71,8 @@ jobs:
       - name: Install kernel build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc bison build-essential clang flex libelf-dev libssl-dev llvm
+          sudo apt-get install -y bc bison build-essential clang flex libelf-dev \
+            libssl-dev lld llvm
 
       - name: Build pinned Sparse
         run: |
