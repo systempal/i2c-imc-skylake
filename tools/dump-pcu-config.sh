@@ -58,8 +58,10 @@ echo "=== engine registers ==="
 snapshot_regs "$BDF"
 echo
 
+# lspci -xxxx prints two-digit offsets for the first 256 bytes and three or
+# more digits above that, so anchor on the short form here.
 echo "=== neighbourhood of the Broadwell TSODCNTL offset (0xe0) ==="
-awk '/^0[cdef]0:/ { print }' "$second"
+awk '/^[cdef]0:/ { print }' "$second"
 echo
 echo "=== the driver's register window (0x90-0xbf) ==="
-awk '/^0[9ab]0:/ { print }' "$second"
+awk '/^[9ab]0:/ { print }' "$second"

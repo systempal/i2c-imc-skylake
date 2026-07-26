@@ -1,17 +1,13 @@
 config I2C_IMC_SKYLAKE
 	tristate "Intel Skylake-X iMC SMBus adapter"
-	depends on PCI && (PCI_MMCONFIG || COMPILE_TEST)
+	depends on PCI && (X86_64 || COMPILE_TEST)
 	help
 	  Say Y here if you want kernel support for the integrated memory
 	  controller (iMC) SMBus engine found in Intel Skylake-X / Cascade
 	  Lake-X processors (socket LGA 2066, platform X299, PCU function
 	  8086:2085).
 
-	  The engine is exposed through the PCI configuration space of the
-	  PCU function.  Those registers are unreachable through the config
-	  accessors the platform selects for the first 256 bytes, so the
-	  driver reaches them through the memory-mapped (ECAM) path.  Two
-	  I2C adapters are registered, one per hardware SMBus channel,
+	  Two I2C adapters are registered, one per hardware SMBus channel,
 	  allowing access to DDR4 DIMM SPD EEPROMs (0x50-0x57) and thermal
 	  sensors from userspace via standard i2c-tools and lm-sensors.
 

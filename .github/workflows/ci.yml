@@ -43,8 +43,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential clang llvm linux-headers-$(uname -r)
 
-      # A stock kernel has no pci_mmcfg_read_config() yet, so this exercises
-      # the compat/ shim path. The in-tree job below covers the real thing.
       - name: Build module
         run: make W=1 KCFLAGS=-W ${{ matrix.make_args }}
 
@@ -69,7 +67,7 @@ jobs:
           if-no-files-found: error
 
   in-tree:
-    name: Current i2c-host integration (2-patch series)
+    name: Current i2c-host integration
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -91,12 +89,6 @@ jobs:
       - name: Prepare current maintainer tree
         run: |
           git clone --depth=1 --branch i2c/i2c-host "$I2C_TREE" linux-i2c
-          # Patch 1/2: the PCI/x86 accessor the driver depends on. If this
-          # stops applying, the tracked copy is stale and must be refreshed
-          # from the kernel tree - that is a real failure, not CI noise.
-          git -C linux-i2c apply --verbose \
-            ../docs/submission/0001-pci-mmcfg-accessor.patch
-          # Patch 2/2: the driver itself.
           cp i2c-imc-skylake.c linux-i2c/drivers/i2c/busses/
           cat docs/submission/Kconfig.kernel >> linux-i2c/drivers/i2c/busses/Kconfig
           printf '%s\n' 'obj-$(CONFIG_I2C_IMC_SKYLAKE) += i2c-imc-skylake.o' \
@@ -110,15 +102,10 @@ jobs:
           scripts/config --file ../linux-out/.config --enable I2C --module I2C_IMC_SKYLAKE
           make O=../linux-out olddefconfig
           grep '^CONFIG_I2C_IMC_SKYLAKE=m' ../linux-out/.config
-          grep '^CONFIG_PCI_MMCONFIG=y' ../linux-out/.config
 
-      - name: Build the series in-tree
+      - name: Build driver in-tree
         working-directory: linux-i2c
-        run: |
-          make O=../linux-out W=1 \
-            drivers/pci/access.o \
-            arch/x86/pci/mmconfig-shared.o \
-            drivers/i2c/busses/i2c-imc-skylake.o
+        run: make O=../linux-out W=1 drivers/i2c/busses/i2c-imc-skylake.o
 
       - name: Build arm64 COMPILE_TEST with Clang
         working-directory: linux-i2c
@@ -130,15 +117,12 @@ jobs:
           make O=../linux-out-arm64 ARCH=arm64 LLVM=1 olddefconfig
           grep '^CONFIG_I2C_IMC_SKYLAKE=m' ../linux-out-arm64/.config
           make O=../linux-out-arm64 ARCH=arm64 LLVM=1 W=1 \
-            drivers/pci/access.o \
             drivers/i2c/busses/i2c-imc-skylake.o
 
       - name: Run Sparse in-tree
         working-directory: linux-i2c
         run: |
           make O=../linux-out C=2 CF=-D__CHECK_ENDIAN__ \
-            drivers/pci/access.o \
-            arch/x86/pci/mmconfig-shared.o \
             drivers/i2c/busses/i2c-imc-skylake.o
 
       - name: Run current-tree checkpatch
@@ -146,8 +130,6 @@ jobs:
         run: |
           scripts/checkpatch.pl --strict --no-tree -f \
             drivers/i2c/busses/i2c-imc-skylake.c
-          scripts/checkpatch.pl --strict \
-            ../docs/submission/0001-pci-mmcfg-accessor.patch
 
       - name: Build the documentation
         working-directory: linux-i2c

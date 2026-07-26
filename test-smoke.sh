@@ -240,12 +240,13 @@ else
 	_ok "no foreign master detected during the test"
 fi
 
-# Likewise for a command the engine never accepted: that path exists because
-# the done bits are latched and must not be mistaken for a fresh completion.
-if grep -q 'command not accepted' <<< "$NEW_DMESG"; then
-	_fail "engine did not accept a command; config access path is unreliable"
+# Likewise for a command that never reached the register: that path exists
+# because the done bits are latched and a stale DONE must not be mistaken for
+# a fresh completion.
+if grep -q 'did not reach the register' <<< "$NEW_DMESG"; then
+	_fail "a command never reached the register; config access is unreliable"
 else
-	_ok "every command was accepted by the engine"
+	_ok "every command reached the register"
 fi
 
 echo "=== result: $PASS passed, $FAIL failed ==="

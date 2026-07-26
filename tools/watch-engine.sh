@@ -46,13 +46,13 @@ deadline=$((SECONDS + SECONDS_TOTAL))
 while ((SECONDS < deadline)); do
 	sleep "$INTERVAL"
 	mapfile -t current < <(snapshot_regs "$BDF")
-	((samples++))
+	samples=$((samples + 1))
 
 	for i in "${!current[@]}"; do
 		if [[ "${current[i]}" != "${previous[i]}" ]]; then
 			printf '%s CHANGE %s -> %s\n' \
 				"$(date -Is)" "${previous[i]}" "${current[i]}"
-			((changes++))
+			changes=$((changes + 1))
 		fi
 	done
 	previous=("${current[@]}")

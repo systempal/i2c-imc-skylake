@@ -6,17 +6,6 @@ INSTALL_MOD_PATH ?= $(DESTDIR)
 INSTALL_MOD_DIR  ?= updates
 PWD    := $(shell pwd)
 
-# The driver calls pci_mmcfg_{read,write}_config(), added by patch 1/2 of the
-# upstream series. Against a kernel that does not have them yet, force-include
-# the out-of-tree shim so the driver source stays identical to the submitted
-# patch. See compat/pci-mmcfg-compat.h.
-IMC_NEED_COMPAT := $(shell grep -qs pci_mmcfg_read_config \
-	$(srctree)/include/linux/pci.h || echo y)
-ifeq ($(IMC_NEED_COMPAT),y)
-ccflags-y += -include $(src)/compat/pci-mmcfg-compat.h
-$(warning i2c-imc-skylake: target kernel lacks pci_mmcfg_read_config(); building with the out-of-tree compat shim)
-endif
-
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 

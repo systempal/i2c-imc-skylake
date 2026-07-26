@@ -31,14 +31,8 @@ Patch series v2 is archived on
 [lore.kernel.org](https://lore.kernel.org/linux-i2c/20260620144131.415559-1-simone.chifari@gmail.com/T/#t)
 and received no replies.
 
-The next posting is an RFC in **two patches**:
-
-1. a PCI/x86 change adding `pci_mmcfg_read_config()` / `pci_mmcfg_write_config()`,
-   which force config access through the memory-mapped (ECAM) path;
-2. this driver, which uses them.
-
-The split exists because those are two decisions belonging to two different
-sets of maintainers. See [docs/submission/cover-letter.txt](docs/submission/cover-letter.txt).
+The next posting is `[PATCH v4]`, a single patch. See
+[docs/submission/cover-letter.txt](docs/submission/cover-letter.txt).
 
 **No iMC I2C driver has ever been merged into mainline.** Andy Lutomirski's
 `i2c_imc` (2013-2016) and Stefan Schaeckeler's 2020 Broadwell rewrite both
@@ -47,21 +41,29 @@ either; it detects it. See the cover letter for what that means in practice.
 
 ---
 
-## Why the ECAM path
+## Retracted: the CF8/CFC claim
 
-The engine's registers are at config offsets `0x9C`-`0xB8`, inside the first
-256 bytes. On x86 that range is dispatched to `raw_pci_ops`, which is CF8/CFC
-whenever configuration type 1 is usable; the memory-mapped path is only used
-from `0x100` upwards. On the tested X299 board a dword written through CF8/CFC
-to the command register does not take effect: the register reads back
-unchanged, the GO bit is never consumed, no transaction is issued. The same
-write through ECAM works.
+Up to v3 this project claimed that firmware filters CF8/CFC config writes to
+the PCU function, and that the registers were reachable only through the
+memory-mapped window. **That was wrong.** It was never tested directly; the
+only evidence was a boot log line naming the access method.
 
-What drops the write is **not known**. Earlier revisions of this project
-attributed it to System Management Mode; the only evidence was a boot log line
-naming the access method, which says nothing about who filters the write, so
-that claim has been removed. [tools/probe-cf8-write.sh](tools/probe-cf8-write.sh)
-is there to settle it with an `MSR_SMI_COUNT` measurement.
+Measured on this board, driver unloaded:
+
+```console
+# setpci -s 16:1e.5 9c.L=20085002    # read SPD 0x50, register 0x02
+# setpci -s 16:1e.5 9c.L
+20005002                             # GO consumed
+# setpci -s 16:1e.5 a8.L
+0000500c                             # READ_DONE, no error
+# setpci -s 16:1e.5 b4.L
+0000000c                             # SPD byte 2: DDR4 type code
+```
+
+The command executes and returns correct data through the ordinary accessors,
+and `MSR_SMI_COUNT` does not move across it. The driver now uses
+`pci_read_config_dword()` and `pci_write_config_dword()` like any other driver.
+Reproduce with [tools/probe-cf8-transaction.sh](tools/probe-cf8-transaction.sh).
 
 ---
 
@@ -73,9 +75,9 @@ is there to settle it with an `MSR_SMI_COUNT` measurement.
   of the transfer, restores both afterwards;
 * **compares the command registers after every transfer** against what it left
   in them, and fails with `-EAGAIN` if anything else changed;
-* requires a positive sign that the engine accepted the command, because the
-  done bits are latched and would otherwise let a never-executed command look
-  like a completed one.
+* reads the command word back and requires it to be the one just written,
+  because the done bits are latched and a stale DONE would otherwise let a
+  command that never reached the register look like a completed transfer.
 
 If your log shows
 
@@ -124,14 +126,6 @@ make checkpatch               # style
 make reload ALLOW_UNSAFE=1    # load for testing, after checking arbitration
 sudo make install             # install into the kernel tree
 ```
-
-The driver calls `pci_mmcfg_read_config()`, which is added by patch 1 of the
-upstream series and is not in any released kernel yet. When the target kernel
-lacks it, the build force-includes
-[compat/pci-mmcfg-compat.h](compat/pci-mmcfg-compat.h), which reimplements the
-two accessors out-of-tree so the driver source stays byte-identical to the
-submitted patch. The build prints a warning when the shim is in use. The shim
-is **not** part of the upstream submission.
 
 To permit a later `modprobe` or PCI modalias load:
 

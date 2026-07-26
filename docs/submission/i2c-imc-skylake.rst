@@ -73,21 +73,8 @@ Config space access
 -------------------
 
 The engine's registers live at config space offsets 0x9C-0xB8 of the PCU
-function.  On x86 the first 256 bytes of config space are reached with the
-access method the platform selected at boot, which is normally CF8/CFC.  On the
-tested board a write issued that way to the command register has no effect: the
-GO bit is never consumed and no SMBus transaction is issued.  The same write
-through the memory-mapped (ECAM) path works.
-
-The driver therefore uses ``pci_mmcfg_read_config()`` and
-``pci_mmcfg_write_config()``, which force the ECAM path for this device.  It
-requires ``CONFIG_PCI_MMCONFIG``; on a system booted with ``pci=nommconf`` the
-driver will fail to probe.
-
-The mechanism that drops the CF8/CFC write has not been identified.
-``MSR_SMI_COUNT`` does not increase across a failing write, so it is not
-attributed to System Management Mode here.
-
+function and are reached with the ordinary ``pci_read_config_dword()`` and
+``pci_write_config_dword()``.  Nothing special is required.
 
 Supported transactions
 ----------------------
