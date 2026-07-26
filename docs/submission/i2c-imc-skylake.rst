@@ -144,13 +144,23 @@ development system that mask is empty and no ``jc42`` binds.
     # echo ee1004 0x50 > /sys/bus/i2c/devices/i2c-6/new_device
     ee1004 6-0050: 512 byte EE1004-compliant SPD EEPROM, read-only
 
-Note that a DDR4 SPD is a 512-byte array reached through a 256-byte window, and
-which half is visible is a property of the bus, not of the transfer.  ``ee1004``
+Two things are worth knowing before instantiating it on this bus.
+
+A DDR4 SPD is a 512-byte array reached through a 256-byte window, and which
+half is visible is a property of the bus, not of the transfer.  ``ee1004``
 selects a page when it needs one and leaves it selected, so a raw ``i2cget``
 issued afterwards may be looking at page 1.  Select page 0 explicitly before
 reading SPD by hand::
 
     # i2cset -y 6 0x36 0x00 c
+
+And a bound ``ee1004`` owns those addresses, so userspace can no longer reach
+them through ``/dev/i2c-*``.  That matters more here than on a mainboard SMBus,
+because the tools that motivate this driver share the bus with the SPDs.  Bind
+``ee1004`` when you want ``decode-dimms``, and remove it when you want the
+addresses back::
+
+    # echo 0x50 > /sys/bus/i2c/devices/i2c-6/delete_device
 
 Module parameters
 -----------------
