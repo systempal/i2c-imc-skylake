@@ -74,11 +74,22 @@ So this driver:
     previous transaction's data.  The engine only ever clears GO, so that
     is the single permitted difference between the two words.
 
-What is missing: no equivalent of Broadwell's TSODCNTL has been identified
-on this part.  Offset 0xe0, where Broadwell has it, reads as zero here.  A
-system with CLTT enabled is therefore expected to trip the interference
-check rather than be arbitrated against.  I would rather ship a driver that
-detects the condition and refuses than one that quietly races.
+  - refuses to bind when the memory controller is polling the DIMM thermal
+    sensors itself.  Intel documents SMBCNTL on the iMC channel function
+    (device 10 and 12, function 0, offsets 0xe88 and 0xe98) in the Xeon
+    Processor Scalable Family datasheet volume 2, reference 614073, section
+    3.1.9.  Its SMB_TSOD_POLL_EN bit is documented as mutually exclusive
+    with SPD command access, so it answers directly whether the engine is
+    in use.  On the test system all four channels read 0xac000000: polling
+    disabled, TSOD_PRESENT mask empty, which also explains why no jc42
+    device appears at 0x18-0x1f.
+
+This is deliberately weaker than what the Broadwell-E driver did.  That one
+switched the polling off for the duration of a transfer.  Reading the bit
+and declining is a smaller claim on hardware the driver does not own, and
+it needs no write to a firmware-configured register.  It covers the memory
+controller only; SMM and a BMC remain out of reach, which is what the
+opt-in is for.
 
 Relation to prior work
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -119,6 +130,7 @@ Changes since v2
     default-off gate, which was logging a driver-core error on every boot.
   - Add Documentation/i2c/busses/i2c-imc-skylake.rst.
   - Drop the ACPI dependency.
+  - Refuse to bind when the iMC reports TSOD polling enabled.
 
 Validation
 ~~~~~~~~~~
@@ -132,12 +144,35 @@ Validation
     per channel, the default-off gate, and 20 unload/reload cycles: 15
     checks, 0 failures, no kernel warning or oops, no interference
     reported, every command word confirmed in the register.
-  - Config space of the PCU function sampled with the driver unloaded: no
-    register changed on its own, and TSOD_ACTIVE was clear on both channels,
-    so no firmware activity was observed on this system.
+  - Engine registers sampled every 2 s for one hour with the driver
+    unloaded: 1791 samples, 0 changes.  No firmware activity was observed
+    on this system.
+  - SMBCNTL on all four iMC channels reads 0xac000000: TSOD polling
+    disabled, TSOD_PRESENT empty.
+  - Write transactions reach the bus: a byte write to an unpopulated
+    address returns -ENXIO with the engine reporting the address NACK, so
+    the write path is issued rather than suppressed.  An end-to-end write
+    to a populated device is not part of this validation; the only
+    non-SPD device on the test system is an LED controller whose reads are
+    themselves unreliable, and SPD writes were out of scope.
 
 Still missing: an independent Tested-by, ideally on Skylake-X rather than
-Cascade Lake-X, and suspend/resume testing with active I2C clients.
+Cascade Lake-X, suspend/resume testing with active I2C clients, and an
+end-to-end write to a populated device.
+
+One note on the register interface, since a reader with the datasheet will
+ask.  That document describes an SMBus interface on the iMC channel
+function at 0xe80-0xe9c, with a different encoding from the one this driver
+uses on PCU function 5 at 0x9c-0xb8; it does not describe function 5 at all,
+covering device 30 functions 0 and 2 only.  I tried the documented path on
+this system: issuing SMBCMD with CMD_TRIGGER sets SMB_RDO and clears
+SMB_BUSY, but returns 0x00 for a populated DIMM at 0x50, for a second one
+at 0x52, and for an empty slot at 0x57 alike, with SMB_SBE never set.  An
+interface that cannot tell a populated slot from an empty one is not
+reaching the bus here, while the path this driver uses returns the correct
+SPD contents and a NACK for the empty slot.  I may well be missing a setup
+step; if someone knows what it is, I would rather use the documented
+interface.
 
 Tool assistance
 ~~~~~~~~~~~~~~~

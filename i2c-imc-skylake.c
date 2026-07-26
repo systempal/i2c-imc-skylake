@@ -57,6 +57,18 @@
 /* PCI id of the Sky Lake-E PCU function carrying the SMBus engine */
 #define PCU_DEVICE	0x2085
 
+/*
+ * The iMC channel function, device 10 and 12 function 0, carries the SMBus
+ * control register documented in the Intel Xeon Processor Scalable Family
+ * datasheet volume 2 (reference 614073) section 3.1.9.  Only SMBCNTL is read
+ * here, and only to find out whether the hardware is polling the DIMM thermal
+ * sensors on its own.
+ */
+#define IMC_CHANNEL_DEVICE	0x2040
+#define IMC_SMBCNTL(ch)		(0xE88 + (ch) * 0x10)
+#define SMBCNTL_TSOD_POLL_EN	BIT(8)
+#define SMBCNTL_TSOD_PRESENT	GENMASK(7, 0)
+
 /* per-channel register offsets in the function's config space */
 #define CH0_CTRL	0xB4
 #define CH0_DATA	0x9C
@@ -524,6 +536,51 @@ static int imc_resume(struct device *dev)
 
 static DEFINE_SIMPLE_DEV_PM_OPS(imc_pm_ops, imc_suspend, imc_resume);
 
+/*
+ * Refuse to share the engine with the memory controller's own thermal
+ * throttling.  SMBCNTL.TSOD_POLL_EN tells us directly whether the iMC is
+ * issuing SMBus transactions of its own; Intel documents that SPD command
+ * access and TSOD polling are mutually exclusive, so a set bit means the
+ * engine is not ours to drive.  This does not cover SMM or a BMC, which
+ * remain the reason for the allow_unsafe_access gate.
+ */
+static int imc_check_firmware_polling(struct pci_dev *pdev)
+{
+	struct pci_dev *imc = NULL;
+	unsigned int found = 0;
+	int i;
+
+	while ((imc = pci_get_device(PCI_VENDOR_ID_INTEL, IMC_CHANNEL_DEVICE,
+				     imc))) {
+		found++;
+		for (i = 0; i < ARRAY_SIZE(imc_chans); i++) {
+			u32 cntl;
+
+			if (pci_read_config_dword(imc, IMC_SMBCNTL(i), &cntl))
+				continue;
+
+			if (cntl & SMBCNTL_TSOD_POLL_EN) {
+				dev_err(&pdev->dev,
+					"%s ch%d has TSOD polling enabled (SMBCNTL 0x%08x); the memory controller is using the engine\n",
+					pci_name(imc), i, cntl);
+				pci_dev_put(imc);
+				return -EBUSY;
+			}
+
+			dev_dbg(&pdev->dev,
+				"%s ch%d SMBCNTL 0x%08x, TSOD present mask 0x%02lx\n",
+				pci_name(imc), i, cntl,
+				cntl & SMBCNTL_TSOD_PRESENT);
+		}
+	}
+
+	if (!found)
+		dev_warn(&pdev->dev,
+			 "no iMC channel function found; cannot verify that TSOD polling is disabled\n");
+
+	return 0;
+}
+
 static int imc_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct imc_smbus *s;
@@ -534,6 +591,10 @@ static int imc_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 			 "firmware/SMM arbitration is unknown; set allow_unsafe_access=1 to bind\n");
 		return -ENODEV;
 	}
+
+	ret = imc_check_firmware_polling(pdev);
+	if (ret)
+		return ret;
 
 	s = devm_kzalloc(&pdev->dev, sizeof(*s), GFP_KERNEL);
 	if (!s)

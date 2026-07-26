@@ -48,7 +48,18 @@ Do this only on a system where concurrent firmware access has been excluded.
 Desktop and HEDT boards have no BMC, but CLTT may still be enabled by the
 firmware.
 
-The driver reduces, but cannot remove, the risk:
+The driver reduces, but cannot remove, the risk.
+
+At probe it reads SMBCNTL on every iMC channel function (device 10 and 12,
+function 0; offsets 0xe88 and 0xe98, documented in the Intel Xeon Processor
+Scalable Family datasheet volume 2, reference 614073, section 3.1.9).
+``SMB_TSOD_POLL_EN`` in that register says whether the memory controller is
+polling the DIMM thermal sensors on its own, which Intel documents as mutually
+exclusive with SPD command access.  If the bit is set on any channel the driver
+refuses to bind: the engine is not ours to drive.  This covers the memory
+controller, not SMM or a BMC, which remain the reason for the opt-in.
+
+Per transfer:
 
   * every transaction waits for both channels to report idle before it
     touches any register;
