@@ -90,21 +90,34 @@ function and are reached with the ordinary ``pci_read_config_dword()`` and
 Supported transactions
 ----------------------
 
-The driver implements SMBus Read/Write Byte Data and Read/Write Word Data.
+The driver implements SMBus Receive Byte and Send Byte, Read/Write Byte Data
+and Read/Write Word Data.
 
-That is enough for ``jc42`` (TSOD), which asks for exactly those two.  It is
-**not** enough for ``ee1004``: both of its accepted combinations include
-``I2C_FUNC_SMBUS_BYTE``, which this adapter does not implement, so the driver
-probe fails with ``-EPFNOSUPPORT``.  SPD bytes are still readable directly with
-``i2cget``.  Implementing SMBus Receive Byte would make ``ee1004`` and
-``decode-dimms`` work; it is the most useful thing still missing.
+That covers ``jc42`` (TSOD) and ``ee1004``, so ``decode-dimms`` reads the whole
+512-byte DDR4 SPD, including the manufacturer and part-number fields that live
+on page 1.
 
-SMBus Quick and Receive Byte are not implemented, so ``i2cdetect`` cannot scan
-these buses.  Address a device directly instead, for example SPD byte 2 of the
-EEPROM at 0x50::
+Receive Byte and Send Byte need a command word that puts no register byte on
+the bus.  The engine encodes that in bit 18, which is not documented for this
+function.  It was found by noting that the interface Intel does document for
+the iMC channel functions (SMBCMD, datasheet reference 614073, section 3.1.8)
+places ``PNTR_SEL`` immediately above ``WORD_ACCESS``, and that word access
+here is bit 17.  With the bit set, consecutive reads of an SPD EEPROM return
+consecutive bytes, which is the auto-increment behaviour of a Receive Byte and
+cannot be produced by a transfer that names a register.
 
-    $ i2cget -y 6 0x50 0x02
-    0x0c
+SMBus Quick is not implemented.  ``i2cdetect`` therefore has to be run in
+read mode::
+
+    $ i2cdetect -y -r 6
+         0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f
+    20: -- -- -- -- -- -- -- 27 -- -- -- -- -- -- -- --
+    30: 30 31 -- -- 34 35 36 -- -- -- -- -- -- -- -- --
+    50: 50 -- 52 -- -- -- -- -- -- -- -- -- -- -- -- --
+
+Not advertising Quick is deliberate as well as accurate.  A write to the
+0x30-0x37 range is how an EE1004 SPD is write-protected, permanently on many
+modules, so an adapter on a memory bus should not offer probing that writes.
 
 Block transfers are not implemented.  The engine has block primitives, but no
 device on this bus needs them.
@@ -126,8 +139,18 @@ description of these buses and the driver does not scan.
 Whether one is populated is visible in ``SMBCNTL.TSOD_PRESENT``; on the
 development system that mask is empty and no ``jc42`` binds.
 
-``ee1004`` will not bind for the reason given above.  Read SPD bytes directly
-instead.
+``ee1004`` binds on each populated SPD address::
+
+    # echo ee1004 0x50 > /sys/bus/i2c/devices/i2c-6/new_device
+    ee1004 6-0050: 512 byte EE1004-compliant SPD EEPROM, read-only
+
+Note that a DDR4 SPD is a 512-byte array reached through a 256-byte window, and
+which half is visible is a property of the bus, not of the transfer.  ``ee1004``
+selects a page when it needs one and leaves it selected, so a raw ``i2cget``
+issued afterwards may be looking at page 1.  Select page 0 explicitly before
+reading SPD by hand::
+
+    # i2cset -y 6 0x36 0x00 c
 
 Module parameters
 -----------------

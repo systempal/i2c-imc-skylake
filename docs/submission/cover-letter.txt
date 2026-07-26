@@ -1,4 +1,4 @@
-Subject: [PATCH v4] i2c: imc-skylake: add Intel Skylake-X iMC SMBus adapter
+Subject: [PATCH v5] i2c: imc-skylake: add Intel Skylake-X iMC SMBus adapter
 
 The integrated memory controller of Intel Skylake-X and Cascade Lake-X
 processors contains an SMBus engine wired to the DDR4 DIMMs.  This driver
@@ -10,7 +10,7 @@ v2 was posted as i2c-imc-x299 and received no replies:
 
   https://lore.kernel.org/linux-i2c/20260620144131.415559-1-simone.chifari@gmail.com/
 
-v3 was never posted.
+v3 and v4 were never posted.
 
 Correction to v2
 ~~~~~~~~~~~~~~~~
@@ -104,16 +104,30 @@ implementation for the same engine, which predates this work:
 
   https://github.com/namazso/PawnIO.Modules/blob/c975ca1d1b8a9c7473a175fa1ca24d83b6cbc8f3/SmbusIntelSkylakeIMC.p
 
-It also implements SMBus BYTE through a pointer-select bit.  That is not
-advertised here because it has not been validated on the Linux system, so
-i2cdetect cannot scan these buses and devices are addressed directly.
+It also implements SMBus BYTE through a pointer-select bit, without saying
+which bit.  That bit is 18 here.  The datasheet gave it away: SMBCMD on the
+iMC channel functions places PNTR_SEL immediately above WORD_ACCESS, and
+word access on the PCU function is bit 17.
 
-That omission costs more than the scan.  Both functionality combinations
-ee1004 accepts include I2C_FUNC_SMBUS_BYTE, so ee1004 does not bind to this
-adapter and decode-dimms does not work through it; SPD bytes are readable
-with i2cget, and jc42 binds fine where a sensor is populated.  Implementing
-Receive Byte is the most useful thing still missing, and I would rather add
-it in a follow-up, validated, than advertise it now.
+Bit 18 is the only part of this driver that rests on an undocumented
+encoding, so it is worth saying exactly what was measured rather than
+asserting it works.  With the bit set on a read, eight consecutive
+transfers to an SPD EEPROM returned bytes 0x01 through 0x08 in order,
+matching an ordinary dump of the same range.  That is the auto-increment
+of a Receive Byte; a transfer that still named a register would have
+returned the same byte eight times.  With the bit set on a write, a Send
+Byte to the DDR4 page-select addresses moves the 256-byte window: byte
+0x00 stops reading as the JEDEC 0x23 after selecting page 1 and returns
+to it after selecting page 0.
+
+ee1004 consequently binds, and decode-dimms reads all four DIMMs on this
+system with both SPD CRCs valid on each.  jc42 binds where a sensor is
+populated.  i2cdetect scans in read mode.
+
+SMBus Quick is still not implemented, and not only because the engine has
+no obvious encoding for it.  A write to the 0x30-0x37 range is how an
+EE1004 SPD is write-protected, permanently on many modules.  An adapter
+whose bus is the memory bus should not advertise a probe that writes.
 
 Changes since v2
 ~~~~~~~~~~~~~~~~
@@ -139,7 +153,9 @@ Changes since v2
   - Drop the ACPI dependency.
   - Refuse to bind when the iMC reports TSOD polling enabled.
   - Correct the claim that BYTE_DATA and WORD_DATA cover ee1004: they do
-    not, ee1004 also needs Receive Byte.
+    not, ee1004 also needs Receive Byte and Send Byte.
+  - Implement both, on the pointer-select bit, so ee1004 binds and
+    decode-dimms works.
 
 Validation
 ~~~~~~~~~~
@@ -147,12 +163,18 @@ Validation
     diagnostics.
   - checkpatch.pl --strict: clean.
   - Sparse with __CHECK_ENDIAN__: clean.
-  - Read-only hardware test on one Intel Core i9-10900X (Cascade Lake-X)
-    system with four DDR4 DIMMs: both adapters, four SPD EEPROMs, BYTE_DATA,
-    WORD_DATA byte order, ENXIO for an absent device, 100 concurrent reads
-    per channel, the default-off gate, and 20 unload/reload cycles: 15
-    checks, 0 failures, no kernel warning or oops, no interference
-    reported, every command word confirmed in the register.
+  - Hardware test on one Intel Core i9-10900X (Cascade Lake-X) system with
+    four DDR4 DIMMs: both adapters, four SPD EEPROMs, BYTE_DATA, WORD_DATA
+    byte order, Receive Byte tracking the EEPROM pointer, Send Byte moving
+    the SPD page and putting it back, ENXIO for an absent device, 100
+    concurrent reads per channel, the default-off gate, and 20
+    unload/reload cycles: 19 checks, 0 failures, no kernel warning or oops,
+    no interference reported, every command word confirmed in the register.
+  - ee1004 bound on all four SPD addresses and decode-dimms decoded all
+    four modules, each with the CRC of bytes 0-125 and of bytes 128-253
+    valid.  The part number reads out of page 1, so the page select is
+    exercised end to end.  The four module serial numbers were identical
+    before and after every experiment in this series.
   - Engine registers sampled every 2 s for one hour with the driver
     unloaded: 1791 samples, 0 changes.  No firmware activity while the
     system is up.
@@ -182,7 +204,7 @@ Validation
     after.
 
 Still missing: an independent Tested-by, ideally on Skylake-X rather than
-Cascade Lake-X, and SMBus Receive Byte so that ee1004 binds.
+Cascade Lake-X.
 
 One note on the register interface, since a reader with the datasheet will
 ask.  That document describes an SMBus interface on the iMC channel

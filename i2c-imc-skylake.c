@@ -95,6 +95,21 @@
 #define GO_BIT		BIT(19)		/* start transaction */
 #define TSOD_ACTIVE_BIT	BIT(20)
 #define WORD_BIT	BIT(17)		/* 16-bit word transfer (vs 8-bit byte) */
+/*
+ * Address-only transfer: the register byte in bits[7:0] is not put on the bus.
+ * A read then returns the byte at the device's own pointer (SMBus Receive
+ * Byte) and a write sends the data byte alone (SMBus Send Byte).
+ *
+ * The bit is not documented for this function.  It was found by noting that
+ * the interface Intel does document for the iMC channel functions (SMBCMD,
+ * datasheet ref. 614073 section 3.1.8) places PNTR_SEL immediately above
+ * WORD_ACCESS, and that word access here is bit 17.  Confirmed on hardware:
+ * with the bit set, eight consecutive reads of an SPD EEPROM returned bytes
+ * 0x01 through 0x08 in order, matching an ordinary dump of the same range,
+ * which is the auto-increment behaviour of a Receive Byte and cannot be
+ * produced by a transfer that names a register.
+ */
+#define PNTR_SEL_BIT	BIT(18)
 #define WRITE_OPERATION	BIT(15)
 #define COMMAND_PREFIX	(COMMAND_TOGGLE | GO_BIT)
 #define COMMAND_KEEP_MASK	(~TSOD_ACTIVE_BIT)
@@ -104,7 +119,7 @@
  * transfer means interference.
  */
 #define COMMAND_OUR_BITS	(COMMAND_TOGGLE | GO_BIT | WORD_BIT | \
-				 GENMASK(15, 0))
+				 PNTR_SEL_BIT | GENMASK(15, 0))
 #define STAT_BUSY	BIT(0)		/* low bit set while transaction in flight */
 #define STAT_ERROR	BIT(1)
 #define STAT_READ_DONE	BIT(2)
@@ -387,6 +402,8 @@ static int imc_access(struct imc_smbus *s, const struct imc_chan *c, u8 addr,
 	command = COMMAND_PREFIX | ((u32)addr << 8) | reg;
 	if (size == I2C_SMBUS_WORD_DATA)
 		command |= WORD_BIT;
+	else if (size == I2C_SMBUS_BYTE)
+		command |= PNTR_SEL_BIT;
 
 	if (read_write == I2C_SMBUS_WRITE) {
 		raw = size == I2C_SMBUS_WORD_DATA ? swab16(*value) : *value;
@@ -433,7 +450,7 @@ restore_command:
 /*
  * Standard SMBus transfer callback.  The per-channel imc_chan is stashed in the
  * adapter's algo_data.  The command word carries the 7-bit address, so
- * SPD EEPROMs (0x50-0x57) are reachable on each channel.  BYTE_DATA and
+ * SPD EEPROMs (0x50-0x57) are reachable on each channel.  BYTE, BYTE_DATA and
  * WORD_DATA are supported; larger transfers would need the engine's block
  * primitives, which are not used by the devices on this bus.
  */
@@ -452,39 +469,61 @@ static s32 imc_smbus_xfer(struct i2c_adapter *adap, u16 addr,
 	if (addr > 0x7f)
 		return -EINVAL;
 
-	if (size != I2C_SMBUS_BYTE_DATA && size != I2C_SMBUS_WORD_DATA)
+	if (size != I2C_SMBUS_BYTE && size != I2C_SMBUS_BYTE_DATA &&
+	    size != I2C_SMBUS_WORD_DATA)
 		return -EOPNOTSUPP;
 	if (read_write != I2C_SMBUS_READ && read_write != I2C_SMBUS_WRITE)
 		return -EINVAL;
 
-	reg = command;
+	/*
+	 * BYTE puts no register on the bus.  For a write the command parameter
+	 * carries the data byte instead, and data is NULL.
+	 */
+	reg = size == I2C_SMBUS_BYTE ? 0 : command;
 
 	mutex_lock(&s->lock);
 	s->io_err = 0;
 
 	if (read_write == I2C_SMBUS_WRITE) {
-		if (size == I2C_SMBUS_WORD_DATA) {
-			dev_dbg(s->dev, "ch%d W addr=%02x reg=%02x val=%04x\n",
-				c->idx, addr, reg, data->word);
+		switch (size) {
+		case I2C_SMBUS_BYTE:
+			val = command;
+			dev_dbg(s->dev, "ch%d W addr=%02x val=%02x (send byte)\n",
+				c->idx, addr, val);
+			break;
+		case I2C_SMBUS_WORD_DATA:
 			val = data->word;
-		} else {
+			dev_dbg(s->dev, "ch%d W addr=%02x reg=%02x val=%04x\n",
+				c->idx, addr, reg, val);
+			break;
+		default:
 			val = data->byte;
 			dev_dbg(s->dev, "ch%d W addr=%02x reg=%02x val=%02x\n",
 				c->idx, addr, reg, val);
+			break;
 		}
 		ret = imc_access(s, c, addr, reg, read_write, size, &val);
 	} else {
 		ret = imc_access(s, c, addr, reg, read_write, size, &val);
-		if (size == I2C_SMBUS_WORD_DATA) {
+		switch (size) {
+		case I2C_SMBUS_BYTE:
+			if (!ret)
+				data->byte = val;
+			dev_dbg(s->dev, "ch%d R addr=%02x -> %02x (receive byte, ret %d)\n",
+				c->idx, addr, val, ret);
+			break;
+		case I2C_SMBUS_WORD_DATA:
 			if (!ret)
 				data->word = val;
 			dev_dbg(s->dev, "ch%d R addr=%02x reg=%02x -> %04x (ret %d)\n",
 				c->idx, addr, reg, val, ret);
-		} else {
+			break;
+		default:
 			if (!ret)
 				data->byte = val;
 			dev_dbg(s->dev, "ch%d R addr=%02x reg=%02x -> %02x (ret %d)\n",
 				c->idx, addr, reg, val, ret);
+			break;
 		}
 	}
 
@@ -504,7 +543,8 @@ static s32 imc_smbus_xfer(struct i2c_adapter *adap, u16 addr,
 
 static u32 imc_func(struct i2c_adapter *adap)
 {
-	return I2C_FUNC_SMBUS_BYTE_DATA | I2C_FUNC_SMBUS_WORD_DATA;
+	return I2C_FUNC_SMBUS_BYTE | I2C_FUNC_SMBUS_BYTE_DATA |
+	       I2C_FUNC_SMBUS_WORD_DATA;
 }
 
 static const struct i2c_algorithm imc_algo = {
