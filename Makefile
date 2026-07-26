@@ -2,8 +2,20 @@ obj-m := i2c-imc-skylake.o
 
 KVER   ?= $(shell uname -r)
 KDIR   ?= /lib/modules/$(KVER)/build
-MODDIR  = /lib/modules/$(KVER)/kernel/drivers/i2c/busses
+INSTALL_MOD_PATH ?= $(DESTDIR)
+INSTALL_MOD_DIR  ?= updates
 PWD    := $(shell pwd)
+
+# The driver calls pci_mmcfg_{read,write}_config(), added by patch 1/2 of the
+# upstream series. Against a kernel that does not have them yet, force-include
+# the out-of-tree shim so the driver source stays identical to the submitted
+# patch. See compat/pci-mmcfg-compat.h.
+IMC_NEED_COMPAT := $(shell grep -qs pci_mmcfg_read_config \
+	$(srctree)/include/linux/pci.h || echo y)
+ifeq ($(IMC_NEED_COMPAT),y)
+ccflags-y += -include $(src)/compat/pci-mmcfg-compat.h
+$(warning i2c-imc-skylake: target kernel lacks pci_mmcfg_read_config(); building with the out-of-tree compat shim)
+endif
 
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
@@ -11,36 +23,32 @@ all:
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 
-# Install into kernel tree + modprobe.
-# Ubuntu/Debian kernel 6.x+ ships .ko.zst; depmod skips uncompressed .ko files,
-# so compress with zstd when available, else fall back to plain .ko.
+# Install through Kbuild so ownership, compression and destination follow the
+# target kernel/distribution policy. Invoke this target with suitable privileges.
 install: all
-	if command -v zstd >/dev/null 2>&1; then \
-		zstd -q -f i2c-imc-skylake.ko -o i2c-imc-skylake.ko.zst; \
-		sudo install -D -m 644 i2c-imc-skylake.ko.zst $(MODDIR)/i2c-imc-skylake.ko.zst; \
-		sudo rm -f $(MODDIR)/i2c-imc-skylake.ko; \
-	else \
-		sudo install -D -m 644 i2c-imc-skylake.ko $(MODDIR)/i2c-imc-skylake.ko; \
-		sudo rm -f $(MODDIR)/i2c-imc-skylake.ko.zst; \
-	fi
-	sudo depmod -a $(KVER)
-	sudo modprobe i2c-imc-skylake
+	$(MAKE) -C $(KDIR) M=$(PWD) modules_install \
+		INSTALL_MOD_PATH=$(INSTALL_MOD_PATH) \
+		INSTALL_MOD_DIR=$(INSTALL_MOD_DIR)
 
-# Remove module and .ko/.ko.zst from kernel tree
+# Remove a module installed in INSTALL_MOD_DIR. Invoke with suitable privileges.
 uninstall:
-	sudo rmmod i2c-imc-skylake 2>/dev/null || true
-	sudo rm -f $(MODDIR)/i2c-imc-skylake.ko $(MODDIR)/i2c-imc-skylake.ko.zst
-	sudo depmod -a $(KVER)
+	rm -f $(INSTALL_MOD_PATH)/lib/modules/$(KVER)/$(INSTALL_MOD_DIR)/i2c-imc-skylake.ko*
+	depmod -a -b $(INSTALL_MOD_PATH) $(KVER)
 
-# Quick rmmod + insmod cycle for leak/oops testing
+# Runtime helpers require explicit acknowledgement of the firmware-arbitration
+# risk: make reload ALLOW_UNSAFE=1 (or make load ALLOW_UNSAFE=1).
 reload: all
+	@test "$(ALLOW_UNSAFE)" = "1" || \
+		{ echo "Refusing: rerun with ALLOW_UNSAFE=1" >&2; exit 2; }
 	sudo rmmod i2c-imc-skylake 2>/dev/null || true
-	sudo insmod i2c-imc-skylake.ko
+	sudo insmod i2c-imc-skylake.ko allow_unsafe_access=1
 
 # Load without build (use after install)
 load:
+	@test "$(ALLOW_UNSAFE)" = "1" || \
+		{ echo "Refusing: rerun with ALLOW_UNSAFE=1" >&2; exit 2; }
 	sudo modprobe i2c-dev
-	sudo modprobe i2c-imc-skylake
+	sudo modprobe i2c-imc-skylake allow_unsafe_access=1
 
 unload:
 	sudo rmmod i2c-imc-skylake 2>/dev/null || true
@@ -53,11 +61,17 @@ checkpatch:
 sparse:
 	$(MAKE) -C $(KDIR) M=$(PWD) C=1 CF="-D__CHECK_ENDIAN__"
 
-# Smoke test — requires root + module loaded (run after make install or make reload)
-test:
-	sudo bash test-smoke.sh
+# Smoke test requires root or non-interactive sudo.
+test: all
+	MODULE_PATH=$(PWD)/i2c-imc-skylake.ko bash test-smoke.sh
+
+# Hardware measurements that the upstream submission still needs. Read-only
+# unless explicitly asked otherwise; see tools/README.md.
+measure:
+	@echo "Run the scripts under tools/ individually; see tools/README.md" >&2
+	@false
 
 log:
 	sudo dmesg | grep i2c-imc-skylake | tail -80
 
-.PHONY: all clean install uninstall reload load unload checkpatch sparse test log
+.PHONY: all clean install uninstall reload load unload checkpatch sparse test measure log

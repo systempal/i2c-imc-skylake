@@ -1,45 +1,106 @@
 # Intel Skylake-X iMC SMBus I2C Driver
 
 [![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html)
-[![Kernel Compatibility](https://img.shields.io/badge/Kernel-6.x%20%7C%207.x-green.svg)](#)
-[![Code Style: checkpatch](https://img.shields.io/badge/checkpatch-clean-brightgreen.svg)](#)
-[![Upstream Status](https://img.shields.io/badge/Upstream-Submitted%20(v2)-orange.svg)](https://lore.kernel.org/linux-i2c/)
+[![CI](https://github.com/systempal/i2c-imc-skylake/actions/workflows/ci.yml/badge.svg)](https://github.com/systempal/i2c-imc-skylake/actions/workflows/ci.yml)
+[![Upstream Status](https://img.shields.io/badge/Upstream-v2%20archived-orange.svg)](https://lore.kernel.org/linux-i2c/20260620144131.415559-1-simone.chifari@gmail.com/T/#t)
 
-A modern Linux PCI bus driver for the integrated Memory Controller (iMC) SMBus controller found in Intel Skylake-X and Cascade Lake-X (HEDT X299, function ID `8086:2085`) processors. 
+An experimental Linux PCI driver for the SMBus engine in the integrated memory
+controller (iMC) of Intel Skylake-X and Cascade Lake-X processors
+(PCU function `8086:2085`).
 
-This driver maps the iMC SMBus engine and registers it as two standard Linux I2C adapters (one per physical channel), allowing native userspace tools like `i2c-tools` and `lm-sensors` to interact with target devices (such as DDR4 DIMM SPD EEPROMs and thermal sensors) without custom raw PCI port-IO writes.
+The engine reaches the DDR4 DIMMs: SPD EEPROMs at `0x50`-`0x57`, thermal
+sensors (TSOD) at `0x18`-`0x1f`, and whatever else a given module carries on
+those lines. The driver registers it as two standard Linux I2C adapters, one
+per hardware channel, so `i2c-tools`, `decode-dimms` and `lm-sensors` work
+without custom raw PCI writes.
 
----
-
-## Origin & Use Case
-
-This driver was born out of the need to control the RGB lighting effects on **Kingston FURY DDR4 RGB** memory modules under Linux on the Intel X299 (HEDT) platform.
-
-These memory modules carry an onboard **ENE KB9012** LED controller accessible via the SMBus channels of the CPU's integrated memory controller (iMC). However, standard Linux tools and OpenRGB could not communicate with them because:
-1. The X299 System Management Mode (SMM) firmware traps standard port-based PCI configuration writes, breaking standard driver access.
-2. The iMC SMBus channels were not exposed as standard Linux I2C buses.
-
-By resolving the MMCONFIG base and using ECAM MMIO, this driver bypasses SMM and registers the physical memory channels as standard `/dev/i2c-*` adapters. 
-
-While the kernel driver itself is kept 100% generic and brand-agnostic (to comply with Linux upstream requirements), its primary practical use cases are:
-* Driving userspace Linux daemons for hardware/software-rendered RGB lighting animations without screen or GUI lag.
-* Enabling compatibility with OpenRGB for memory modules on Skylake-X / Cascade Lake-X systems.
-* Reading standard DDR4 SPD data and DIMM thermal sensor metrics using standard utilities like `decode-dimms`.
+> [!WARNING]
+> The engine has no arbitration mechanism. SMM, a BMC and the memory
+> controller's own closed-loop thermal throttling (CLTT) can drive the same
+> registers, and the PCI ID does not tell the driver whether any of them is
+> active. The driver is disabled by default and binds only with
+> `allow_unsafe_access=1`. Use it only where concurrent firmware access has
+> been excluded — and check the log for the interference warning described
+> below.
 
 ---
 
-## Upstream Status
+## Upstream status
 
-This driver is currently submitted for review to the Linux kernel `linux-i2c` subsystem mailing list for mainlining (patch series v2). See the [lore.kernel.org linux-i2c archive](https://lore.kernel.org/linux-i2c/) for the discussion thread.
+Patch series v2 is archived on
+[lore.kernel.org](https://lore.kernel.org/linux-i2c/20260620144131.415559-1-simone.chifari@gmail.com/T/#t)
+and received no replies.
+
+The next posting is an RFC in **two patches**:
+
+1. a PCI/x86 change adding `pci_mmcfg_read_config()` / `pci_mmcfg_write_config()`,
+   which force config access through the memory-mapped (ECAM) path;
+2. this driver, which uses them.
+
+The split exists because those are two decisions belonging to two different
+sets of maintainers. See [docs/submission/cover-letter.txt](docs/submission/cover-letter.txt).
+
+**No iMC I2C driver has ever been merged into mainline.** Andy Lutomirski's
+`i2c_imc` (2013-2016) and Stefan Schaeckeler's 2020 Broadwell rewrite both
+stalled on the same firmware-arbitration problem. This driver does not solve it
+either; it detects it. See the cover letter for what that means in practice.
 
 ---
 
-## Technical Features & SMM Bypass
+## Why the ECAM path
 
-* **ECAM MMIO Access**: On the X299 platform, System Management Mode (SMM) firmware traps and drops legacy port-based (`CF8/CFC`) configuration space writes to the PCU function. This driver bypasses the trap by resolving the MMCONFIG base from the ACPI `MCFG` table and accessing the registers directly via ECAM MMIO memory-mapped pages.
-* **Dual Channel Support**: Registers two independent I2C buses (`iMC SMBus Skylake-X channel 0` and `channel 1`), mapping physically to DIMM slots 1-2 and 3-4 respectively.
-* **Clean Lifecycle**: Fully compliant with the `devm` kernel framework. All mapped registers, adapters, and mutexes are cleaned up automatically upon driver unbinding.
-* **Zero Out-of-Tree Brandings**: Code is completely generic and compliant with standard Linux kernel styling guidelines.
+The engine's registers are at config offsets `0x9C`-`0xB8`, inside the first
+256 bytes. On x86 that range is dispatched to `raw_pci_ops`, which is CF8/CFC
+whenever configuration type 1 is usable; the memory-mapped path is only used
+from `0x100` upwards. On the tested X299 board a dword written through CF8/CFC
+to the command register does not take effect: the register reads back
+unchanged, the GO bit is never consumed, no transaction is issued. The same
+write through ECAM works.
+
+What drops the write is **not known**. Earlier revisions of this project
+attributed it to System Management Mode; the only evidence was a boot log line
+naming the access method, which says nothing about who filters the write, so
+that claim has been removed. [tools/probe-cf8-write.sh](tools/probe-cf8-write.sh)
+is there to settle it with an `MSR_SMI_COUNT` measurement.
+
+---
+
+## What the driver does about concurrency
+
+* serializes both channels under one mutex and waits for the whole engine to be
+  idle before touching any register;
+* saves the command state of both channels, clears TSOD_ACTIVE for the duration
+  of the transfer, restores both afterwards;
+* **compares the command registers after every transfer** against what it left
+  in them, and fails with `-EAGAIN` if anything else changed;
+* requires a positive sign that the engine accepted the command, because the
+  done bits are latched and would otherwise let a never-executed command look
+  like a completed one.
+
+If your log shows
+
+```text
+i2c-imc-skylake 0000:16:1e.5: ch0 command changed under us (...): another master is using the engine
+```
+
+then firmware is using the engine on your system. Unload the driver.
+
+Not implemented: the Broadwell-E iMC driver additionally stops the PCU's TSOD
+polling for the duration of a transfer. The equivalent register has not been
+identified on this part — see [tools/README.md](tools/README.md).
+
+---
+
+## Origin & use case
+
+This driver started from the need to reach the **ENE KB9012** LED controller on
+Kingston FURY DDR4 RGB modules under Linux on X299, which is on the same iMC
+SMBus lines. It is device-oriented rather than tied to a DIMM brand; the
+practical uses are:
+
+* reading DDR4 SPD data and DIMM thermal sensors with standard tools;
+* OpenRGB and other userspace daemons for modules whose controllers sit on
+  these buses.
 
 ---
 
@@ -47,77 +108,91 @@ This driver is currently submitted for review to the Linux kernel `linux-i2c` su
 
 ### Prerequisites
 
-Ensure you have kernel headers and compiler utilities installed:
-
 ```bash
 # Debian / Ubuntu
-sudo apt-get install build-essential linux-headers-$(uname -r)
+sudo apt-get install build-essential i2c-tools strace linux-headers-$(uname -r)
 
 # Fedora / RHEL
-sudo dnf install gcc make kernel-devel
+sudo dnf install gcc i2c-tools make strace kernel-devel
 ```
 
-### Manual Build & Load
+### Build & load
 
-1. **Compile the driver**:
-   ```bash
-   make
-   ```
-2. **Test style compliance**:
-   ```bash
-   make checkpatch
-   ```
-3. **Load immediately (testing)**:
-   ```bash
-   make reload
-   ```
-4. **Install permanently into the kernel tree**:
-   ```bash
-   sudo make install
-   ```
+```bash
+make                          # build
+make checkpatch               # style
+make reload ALLOW_UNSAFE=1    # load for testing, after checking arbitration
+sudo make install             # install into the kernel tree
+```
 
----
+The driver calls `pci_mmcfg_read_config()`, which is added by patch 1 of the
+upstream series and is not in any released kernel yet. When the target kernel
+lacks it, the build force-includes
+[compat/pci-mmcfg-compat.h](compat/pci-mmcfg-compat.h), which reimplements the
+two accessors out-of-tree so the driver source stays byte-identical to the
+submitted patch. The build prints a warning when the shim is in use. The shim
+is **not** part of the upstream submission.
 
-## DKMS Support (Dynamic Kernel Module Support)
+To permit a later `modprobe` or PCI modalias load:
 
-To build and load the driver automatically on every kernel upgrade:
+```bash
+echo 'options i2c-imc-skylake allow_unsafe_access=1' | \
+  sudo tee /etc/modprobe.d/i2c-imc-skylake.conf
+```
 
-1. **Install DKMS**:
-   ```bash
-   sudo apt-get install dkms
-   ```
-2. **Register the module**:
-   ```bash
-   sudo dkms add .
-   ```
-3. **Build and install**:
-   ```bash
-   sudo dkms install -m i2c-imc-skylake -v 1.0
-   ```
+This opt-in is intentionally not installed by the project.
 
 ---
 
-## Verification & Testing
+## DKMS
 
-Once loaded, verify that the two channels are registered successfully:
+```bash
+sudo apt-get install dkms
+sudo dkms add .
+sudo dkms install -m i2c-imc-skylake -v 1.0.0
+```
+
+---
+
+## Verification
 
 ```bash
 i2cdetect -l | grep iMC
 ```
 
-Expected output:
 ```text
 i2c-6   smbus           iMC SMBus Skylake-X channel 0                SMBus adapter
 i2c-7   smbus           iMC SMBus Skylake-X channel 1                SMBus adapter
 ```
 
-The engine has no SMBus QUICK/BYTE primitive, so `i2cdetect` cannot scan the bus. Read a device directly with a byte-data access (a register offset is always required), e.g. SPD byte 2 (DDR4 type code `0x0c`) from the EEPROM at `0x50` on channel 0:
+The driver advertises SMBus BYTE_DATA and WORD_DATA only, so `i2cdetect` cannot
+scan the bus. Read a device directly — SPD byte 2 (DDR4 type code `0x0c`) from
+EEPROM `0x50` on channel 0:
+
 ```bash
 sudo i2cget -y 6 0x50 0x02
 ```
+
+The adapter does not instantiate `ee1004` or `jc42` clients. Check first that
+the address is not already bound, then:
+
+```bash
+echo ee1004 0x50 | sudo tee /sys/bus/i2c/devices/i2c-6/new_device
+echo jc42 0x18 | sudo tee /sys/bus/i2c/devices/i2c-6/new_device
+```
+
+Read-only integration test against the module just built:
+
+```bash
+make
+sudo make test
+```
+
+Hardware measurements still owed to the upstream submission are in
+[tools/README.md](tools/README.md).
 
 ---
 
 ## License
 
-This driver is licensed under the **GPL v2 only** (`GPL-2.0-only`).
+GPL v2 only (`GPL-2.0-only`).

@@ -5,30 +5,28 @@
  * The integrated memory controller (iMC) on Intel Skylake-X / Cascade Lake-X
  * processors exposes an SMBus engine used to reach the SPD EEPROMs and thermal
  * sensors on DDR4 DIMMs.  The engine is driven through the PCI configuration
- * space of the Sky Lake-E PCU function (0000:16:1e.5, 8086:2085).  This driver
- * presents that engine as two standard Linux I2C adapters - one per hardware
- * SMBus channel - so that i2c-tools and lm-sensors can use it without bespoke
- * sysfs hacks.
+ * space of the Sky Lake-E PCU function (8086:2085).  This driver presents that
+ * engine as two standard Linux I2C adapters - one per hardware SMBus channel -
+ * so that i2c-tools and lm-sensors can use it without bespoke sysfs hacks.
  *
- * Why ECAM MMIO instead of the usual CF8/CFC config accessors:
- *   On this platform System Management Mode (SMM) traps and mangles port-based
- *   (CF8/CFC) writes to the first 256 config bytes of this function, so the SMBus
- *   command never completes.  The boot log reports "PCI: Using configuration
- *   type 1 (probe)" confirming the default path is port-based; the MMCONFIG
- *   (ECAM) window is not trapped.  Windows' NTIOLib reaches the registers via
- *   ECAM, which is how we confirmed the register layout on hardware.  We map the
- *   ECAM page of the target function and drive the registers by MMIO, exactly as
- *   the firmware does.
+ * Why the config accesses go through pci_mmcfg_{read,write}_config():
+ *   The SMBus registers live at offsets 0x9C-0xB8, inside the first 256 config
+ *   bytes.  raw_pci_read()/raw_pci_write() dispatch that range to raw_pci_ops,
+ *   which on this platform is CF8/CFC (the boot log reports "PCI: Using
+ *   configuration type 1").  On the tested board a dword written that way to
+ *   the command register does not take effect: the register reads back without
+ *   the GO bit ever having been consumed and no SMBus transaction is issued.
+ *   The same write through the ECAM window does work, and that is also how the
+ *   register layout was confirmed on hardware.  The mechanism behind the
+ *   dropped write has not been identified; measurements of MSR_SMI_COUNT
+ *   across a failing write show no SMI, so it is not attributed to SMM here.
  *
- *   ECAM phys(off) = mmcfg_base + (bus<<20) + (dev<<15) + (fn<<12) + off
- *   mmcfg_base is read from the ACPI MCFG table at probe time (not hardcoded).
- *
- * Per-channel register triple within the config page:
+ * Per-channel register triple within the config space of the function:
  *                  ch0     ch1
  *     CTRL (data)  0xB4    0xB8   write: data byte in bits[23:16]; read: low byte
- *     DATA (cmd)   0x9C    0xA0   FRAME | (cmd << 8) | reg ; bit19 = GO
- *     STATUS       0xA8    0xAC   busy while bit0 set; done when clear,
- *                                 bit1 (0x02) set on completion = device NACKed
+ *     DATA (cmd)   0x9C    0xA0   command toggle | GO | address | register
+ *     STATUS       0xA8    0xAC   bit0 BUSY, bit1 ERROR/NACK,
+ *                                 bit2 READ_DONE, bit3 WRITE_DONE
  *   SMBus command byte (DATA bits[15:8]) = (rw << 7) | addr7: the 7-bit slave
  *   address with bit7 = direction (1 write / 0 read).  The register/offset goes
  *   in DATA[7:0].  So 0x50 reads SPD EEPROM 0x50.  This was decoded and
@@ -40,21 +38,27 @@
  * all reachable by 7-bit address.
  *
  * Bus arbitration / concurrency with firmware:
- *   The engine could in principle also be driven by SMM or by the iMC's own
- *   closed-loop thermal throttling (CLTT) TSOD polling.  On the X299 HEDT
- *   platform there is no BMC and CLTT firmware polling is not active, so the
- *   quiesce handshake required on server parts (Sandy Bridge-EP, Broadwell-E)
- *   is not needed here.  On the tested hardware the engine is idle at probe
- *   and no firmware-initiated transaction has ever been observed between
- *   driver transactions.  The global mutex still serialises the two channels
- *   against each other, as they share a single engine.
+ *   The driver cannot coordinate with SMM, a BMC, or the iMC's own closed-loop
+ *   thermal throttling (CLTT), and the PCI ID alone does not prove that none of
+ *   them is active.  Binding is therefore disabled by default and requires
+ *   allow_unsafe_access=1, following the same choice made by the earlier iMC
+ *   drivers for Sandy Bridge-EP and Broadwell-E.  On top of that, transactions
+ *   are serialized across both channels, wait for the complete engine to become
+ *   idle, temporarily clear TSOD_ACTIVE, restore the previous command state,
+ *   and verify afterwards that no other master modified the command registers
+ *   while the transfer was in flight.
+ *
+ *   Not implemented: the Broadwell-E driver additionally stops the PCU's TSOD
+ *   polling for the duration of a transfer (write 0 to the polling interval,
+ *   wait 10 ms for in-flight transactions to drain, restore afterwards).  The
+ *   equivalent register has not been identified on this part, so a system with
+ *   CLTT enabled is expected to trip the interference check below rather than
+ *   to be arbitrated against.
  */
 
-#include <linux/acpi.h>
 #include <linux/bits.h>
 #include <linux/delay.h>
 #include <linux/i2c.h>
-#include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -66,13 +70,11 @@
 #define PCU_DEVICE	0x2085
 #define PCU_ID		((PCU_DEVICE << 16) | PCI_VENDOR_ID_INTEL)
 
-#define CFG_SIZE	0x1000UL
-
-/* function-global config registers (offsets within the config page) */
-#define CFG_VENDOR_DEV	0x00	/* cfg[0]: vendor/device id, for ECAM sanity check */
+/* function-global config registers */
+#define CFG_VENDOR_DEV	0x00	/* cfg[0]: vendor/device id, for sanity check */
 #define CFG_IMC_BUS	0xCC	/* cfg[0xCC] bits[15:8]: iMC SMBus bus number */
 
-/* per-channel register offsets within the config page */
+/* per-channel register offsets */
 #define CH0_CTRL	0xB4
 #define CH0_DATA	0x9C
 #define CH0_STAT	0xA8
@@ -82,7 +84,10 @@
 
 /*
  * Command word written to the DATA register:
- *   bits[31:16] = FRAME (engine config + GO bit19), constant
+ *   bit29       = command toggle
+ *   bit20       = TSOD active state, preserved across transfers
+ *   bit19       = GO
+ *   bit17       = word transfer
  *   bits[15:8]  = SMBus command byte = (rw << 7) | addr7
  *                   rw bit (0x80): 1 = write, 0 = read
  *                   addr7        : 7-bit SMBus slave address
@@ -91,16 +96,43 @@
  * encoding was confirmed on hardware: command 0x50 reads SPD EEPROM 0x50
  * (DDR4 signature).
  */
-#define ENGINE_ENABLE	BIT(29)		/* engine enable bit */
+#define COMMAND_TOGGLE	BIT(29)
 #define GO_BIT		BIT(19)		/* start transaction */
-#define FRAME		(ENGINE_ENABLE | GO_BIT)
-#define RW_WRITE	0x80		/* OR into the command byte for a write */
+#define TSOD_ACTIVE_BIT	BIT(20)
 #define WORD_BIT	BIT(17)		/* 16-bit word transfer (vs 8-bit byte) */
+#define WRITE_OPERATION	BIT(15)
+#define COMMAND_PREFIX	(COMMAND_TOGGLE | GO_BIT)
+#define COMMAND_KEEP_MASK	(~TSOD_ACTIVE_BIT)
+/* command bits this driver produces itself; everything else belongs to nobody
+ * we know about, so a change in them during a transfer means interference.
+ */
+#define COMMAND_OUR_BITS	(COMMAND_TOGGLE | GO_BIT | WORD_BIT | \
+				 GENMASK(15, 0))
 #define STAT_BUSY	BIT(0)		/* low bit set while transaction in flight */
-#define STAT_NACK	BIT(1)		/* set on completion if the device NACKed */
+#define STAT_ERROR	BIT(1)
+#define STAT_READ_DONE	BIT(2)
+#define STAT_WRITE_DONE	BIT(3)
+#define STAT_ANY_DONE	(STAT_ERROR | STAT_READ_DONE | STAT_WRITE_DONE)
+
+/*
+ * Polling bounds.  Transactions on the tested system complete in a few
+ * milliseconds; these are upper bounds that avoid busy-spinning and cover
+ * device clock stretching, not a measured multi-platform worst case.  The
+ * mutex is held across a whole transfer, so the worst case a caller on the
+ * other channel can wait for is the sum of all of them, roughly 750 ms.
+ */
+#define IMC_POLL_US		10
+#define IMC_IDLE_TIMEOUT_US	50000
+#define IMC_GO_TIMEOUT_US	200000
+#define IMC_DONE_TIMEOUT_US	50000
+
+static bool allow_unsafe_access;
+module_param(allow_unsafe_access, bool, 0444);
+MODULE_PARM_DESC(allow_unsafe_access,
+		 "allow access without firmware/SMM arbitration (unsafe)");
 
 struct imc_chan {
-	u32 ctrl, data, stat;
+	unsigned int ctrl, data, stat;
 	int idx;			/* channel index 0 or 1 */
 };
 
@@ -111,229 +143,301 @@ static const struct imc_chan imc_chans[2] = {
 
 /* one driver state object, shared by both per-channel adapters */
 struct imc_smbus {
+	struct pci_dev *pdev;		/* config space carrying the engine */
 	struct device *dev;		/* &pdev->dev, for dev_*() logging */
-	void __iomem *cfg;		/* ioremapped ECAM page of the function */
 	struct mutex lock;		/* serialises all SMBus transactions */
-					/* needed: both channels share same ECAM mapping */
+					/* needed: both channels share one engine */
 	struct i2c_adapter adap[2];	/* one per hardware channel */
+	int io_err;			/* sticky config-access error, under lock */
+};
+
+struct imc_xfer_state {
+	u32 command[ARRAY_SIZE(imc_chans)];
+	bool restore[ARRAY_SIZE(imc_chans)];
 };
 
 /*
- * ECAM base discovery from ACPI MCFG.  acpi_table_parse() is not exported to
- * modules, so map the MCFG table with acpi_get_table() (exported) and walk the
- * allocation entries by hand.  Uses pdev's PCI segment and bus number so no
- * module parameter override is needed.  CONFIG_ACPI is guaranteed by Kconfig.
+ * Config accessors.  Every access goes through the ECAM path; see the comment
+ * at the top of the file.  A failure is recorded in s->io_err and reported
+ * once, at the end of the transfer, so the transaction logic does not have to
+ * check a return value on every register touch.  A failed read yields all-ones,
+ * which no polling loop mistakes for a completed transaction.
  */
-static u64 imc_detect_mmcfg_base(struct pci_dev *pdev)
-{
-	unsigned int seg = pci_domain_nr(pdev->bus);
-	unsigned int bus = pdev->bus->number;
-	struct acpi_table_header *hdr;
-	struct acpi_table_mcfg *mcfg;
-	struct acpi_mcfg_allocation *e;
-	unsigned long n, i;
-	u64 base = 0;
-
-	if (ACPI_FAILURE(acpi_get_table(ACPI_SIG_MCFG, 0, &hdr)))
-		return 0;
-
-	mcfg = (struct acpi_table_mcfg *)hdr;
-	if (hdr->length < sizeof(*mcfg)) {
-		acpi_put_table(hdr);
-		return 0;
-	}
-	e = (struct acpi_mcfg_allocation *)(mcfg + 1);
-	n = (hdr->length - sizeof(*mcfg)) / sizeof(*e);
-	for (i = 0; i < n; i++) {
-		if (e[i].pci_segment == seg &&
-		    bus >= e[i].start_bus_number &&
-		    bus <= e[i].end_bus_number) {
-			base = e[i].address;
-			break;
-		}
-	}
-	acpi_put_table(hdr);
-	return base;
-}
-
-/*
- * Wait until GO clears (transaction issued), then until the busy bit drops.
- * Returns 0 on completion, -ETIMEDOUT if the engine never went idle.  On
- * success *status (if non-NULL) gets the final status word.  Process context
- * only - it sleeps between polls.
- *
- * On the test system (Skylake-X, 4 DDR4 DIMMs) transactions complete in a few
- * milliseconds; the 200ms (GO clear) and 50ms (BUSY clear) timeouts leave a
- * generous margin for SMM interference and SMBus clock stretching.
- */
-static int imc_wait(struct imc_smbus *s, const struct imc_chan *c, u32 *status)
+static u32 imc_reg(struct imc_smbus *s, unsigned int off)
 {
 	u32 val;
 	int ret;
 
-	ret = readl_poll_timeout(s->cfg + c->data, val, !(val & GO_BIT), 10, 200000);
-	if (ret)
-		return ret;
-
-	ret = readl_poll_timeout(s->cfg + c->stat, val, !(val & STAT_BUSY), 10, 50000);
-	if (ret)
-		return ret;
-
-	if (status)
-		*status = val;
-
-	return 0;
-}
-
-/*
- * Poll the busy bit clear only (no GO check).  The firmware polls STATUS after
- * the CTRL (data-latch) write too, before issuing the DATA/GO word.
- * Timeout: 50ms, same rationale as in imc_wait().
- *
- * Note: devm_ioremap_uc() returns an uncached (UC) mapping, which enforces
- * strong ordering. writel() includes a full mb() barrier, ensuring the write
- * is visible to hardware before polling begins.
- */
-static int imc_wait_status(struct imc_smbus *s, const struct imc_chan *c)
-{
-	u32 val;
-	int ret;
-
-	ret = readl_poll_timeout(s->cfg + c->stat, val, !(val & STAT_BUSY), 10, 50000);
+	ret = pci_mmcfg_read_config(s->pdev, off, 4, &val);
 	if (ret) {
-		dev_dbg(s->dev, "pre-command poll timed out, engine still busy\n");
-		return ret;
+		s->io_err = ret;
+		return ~0U;
 	}
 
-	return 0;
+	return val;
 }
 
-/* translate a completed transaction's status into an errno (0 = ACK) */
-static int imc_check_status(struct imc_smbus *s, u32 status, u8 addr, u8 reg)
+static void imc_set(struct imc_smbus *s, unsigned int off, u32 val)
 {
-	if (status & STAT_NACK) {
-		/* no device at this address, or it refused the access */
+	int ret;
+
+	ret = pci_mmcfg_write_config(s->pdev, off, 4, val);
+	if (ret)
+		s->io_err = ret;
+}
+
+static u32 imc_busy_mask(struct imc_smbus *s)
+{
+	u32 busy = 0;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(imc_chans); i++)
+		if (imc_reg(s, imc_chans[i].stat) & STAT_BUSY)
+			busy |= BIT(i);
+
+	return busy;
+}
+
+static int imc_wait_engine_idle(struct imc_smbus *s)
+{
+	u32 busy;
+	int ret;
+
+	ret = read_poll_timeout(imc_busy_mask, busy, !busy || s->io_err,
+				IMC_POLL_US, IMC_IDLE_TIMEOUT_US, false, s);
+	if (ret)
+		dev_warn_ratelimited(s->dev,
+				     "engine busy on channel mask 0x%x\n", busy);
+
+	return ret;
+}
+
+static int imc_wait_go_clear(struct imc_smbus *s, const struct imc_chan *c)
+{
+	u32 val;
+
+	return read_poll_timeout(imc_reg, val, !(val & GO_BIT) || s->io_err,
+				 IMC_POLL_US, IMC_GO_TIMEOUT_US, false,
+				 s, c->data);
+}
+
+static int imc_wait_done(struct imc_smbus *s, const struct imc_chan *c,
+			 u32 *status)
+{
+	u32 val;
+	int ret;
+
+	ret = read_poll_timeout(imc_reg, val,
+				(!(val & STAT_BUSY) && (val & STAT_ANY_DONE)) ||
+				s->io_err,
+				IMC_POLL_US, IMC_DONE_TIMEOUT_US, false,
+				s, c->stat);
+	*status = val;
+
+	return ret;
+}
+
+static int imc_wait_transfer(struct imc_smbus *s, const struct imc_chan *c,
+			     u32 *status)
+{
+	u32 command;
+	int ret;
+
+	ret = imc_wait_go_clear(s, c);
+	if (ret)
+		*status = imc_reg(s, c->stat);
+	else
+		ret = imc_wait_done(s, c, status);
+	if (!ret)
+		return 0;
+	if (!(*status & STAT_BUSY) || (*status & STAT_ANY_DONE))
+		return ret;
+
+	command = imc_reg(s, c->data);
+	imc_set(s, c->data, command ^ COMMAND_TOGGLE);
+	imc_reg(s, c->data);
+
+	ret = imc_wait_done(s, c, status);
+	if (ret)
+		dev_warn_ratelimited(s->dev,
+				     "ch%d recovery timed out (stat 0x%08x)\n",
+				     c->idx, *status);
+
+	return ret;
+}
+
+static int imc_check_status(struct imc_smbus *s, const struct imc_chan *c,
+			    u32 status, u32 expected, u8 addr, u8 reg)
+{
+	if (status & STAT_ERROR) {
 		dev_dbg(s->dev, "addr 0x%02x reg 0x%02x NACK (stat 0x%08x)\n",
 			addr, reg, status);
 		return -ENXIO;
 	}
-	return 0;
-}
 
-/* SMBus write-byte to addr: latch the data byte, then issue the command. */
-static int imc_write_byte(struct imc_smbus *s, const struct imc_chan *c,
-			  u8 addr, u8 reg, u8 val)
-{
-	u32 status = 0;
-	int ret;
-
-	writel((u32)val << 16, s->cfg + c->ctrl);
-	ret = imc_wait_status(s, c);
-	if (ret)
-		return ret;
-	writel(FRAME | ((u32)(addr | RW_WRITE) << 8) | reg, s->cfg + c->data);
-	ret = imc_wait(s, c, &status);
-	if (ret) {
+	/* Done bits are latched; only the bit for this operation is required. */
+	if (!(status & expected)) {
 		dev_warn_ratelimited(s->dev,
-				     "write addr 0x%02x reg 0x%02x timed out\n",
-				     addr, reg);
-		return ret;
+				     "ch%d unexpected completion for addr 0x%02x reg 0x%02x (stat 0x%08x)\n",
+				     c->idx, addr, reg, status);
+		return -EIO;
 	}
-	ret = imc_check_status(s, status, addr, reg);
-	if (ret)
-		return ret;
 
-	return 0;
-}
-
-/* SMBus read-byte from addr: issue the command, return the low data byte. */
-static int imc_read_byte(struct imc_smbus *s, const struct imc_chan *c,
-			 u8 addr, u8 reg, u8 *val)
-{
-	u32 status = 0;
-	int ret;
-
-	ret = imc_wait_status(s, c);
-	if (ret)
-		return ret;
-	writel(FRAME | ((u32)addr << 8) | reg, s->cfg + c->data);
-	ret = imc_wait(s, c, &status);
-	if (ret) {
-		dev_warn_ratelimited(s->dev,
-				     "read addr 0x%02x reg 0x%02x timed out\n",
-				     addr, reg);
-		return ret;
-	}
-	ret = imc_check_status(s, status, addr, reg);
-	if (ret)
-		return ret;
-	*val = readl(s->cfg + c->ctrl) & 0xFF;
 	return 0;
 }
 
 /*
- * SMBus write-word to addr: latch the 16-bit value into CTRL[31:16], then
- * issue the command with WORD_BIT set.  The value is byte-swapped between host
- * order and the engine's CTRL byte layout (swab16) so that data->word follows
- * the standard SMBus convention (low data byte first).  The read path applies
- * the inverse swap.
+ * The done bits are latched and the driver has found no way to clear them, so
+ * a transaction that is never started at all would otherwise be indistinguish-
+ * able from one that completed: STATUS still shows the previous DONE and the
+ * caller would receive the previous transaction's data as valid.
  *
- * Validated on hardware: a WORD read returns the same byte order as two
- * consecutive BYTE_DATA reads (word low byte == register R, high byte == R+1),
- * confirmed against DDR4 SPD bytes.  This is exactly the convention jc42 relies
- * on via i2c_smbus_read_word_swapped(), so no double swap occurs.
+ * Require one of two positive signs that the engine acted on the command: the
+ * GO bit was observed set in the read-back that follows the command write, or
+ * STATUS changed during the transfer.  Neither of them appearing means nothing
+ * happened.
  */
-static int imc_write_word(struct imc_smbus *s, const struct imc_chan *c,
-			  u8 addr, u8 reg, u16 val)
+static bool imc_engine_responded(bool go_seen, u32 status_pre, u32 status)
 {
-	u32 status = 0;
-	int ret;
-
-	/* host order -> engine CTRL byte order (see function comment) */
-	writel((u32)swab16(val) << 16, s->cfg + c->ctrl);
-	ret = imc_wait_status(s, c);
-	if (ret)
-		return ret;
-	writel(FRAME | WORD_BIT | ((u32)(addr | RW_WRITE) << 8) | reg,
-	       s->cfg + c->data);
-	ret = imc_wait(s, c, &status);
-	if (ret) {
-		dev_warn_ratelimited(s->dev,
-				     "write word addr 0x%02x reg 0x%02x timed out\n",
-				     addr, reg);
-		return ret;
-	}
-	return imc_check_status(s, status, addr, reg);
+	return go_seen || status != status_pre;
 }
 
 /*
- * SMBus read-word from addr: issue the command with WORD_BIT set, return the
- * 16-bit value from CTRL[15:0] byte-swapped back to host order (inverse of the
- * write path).  See imc_write_word() for the byte-order convention.
+ * Detect a second master.  Compare the command registers against what this
+ * driver left in them: for the channel it drove, only the bits it does not own;
+ * for the other channel, all of them.  A difference means firmware, a BMC or
+ * CLTT touched the engine while the transfer was in flight, so the result
+ * cannot be trusted.
  */
-static int imc_read_word(struct imc_smbus *s, const struct imc_chan *c,
-			 u8 addr, u8 reg, u16 *val)
+static int imc_check_interference(struct imc_smbus *s, const struct imc_chan *c,
+				  const struct imc_xfer_state *state)
 {
-	u32 status = 0, raw;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(imc_chans); i++) {
+		u32 mask = i == c->idx ? ~COMMAND_OUR_BITS : ~0U;
+		u32 expect = state->command[i] & COMMAND_KEEP_MASK;
+		u32 now = imc_reg(s, imc_chans[i].data);
+
+		if (!((now ^ expect) & mask))
+			continue;
+
+		dev_warn_ratelimited(s->dev,
+				     "ch%d command changed under us (0x%08x -> 0x%08x): another master is using the engine\n",
+				     i, expect, now);
+		return -EAGAIN;
+	}
+
+	return 0;
+}
+
+static void imc_restore_xfer(struct imc_smbus *s,
+			     const struct imc_xfer_state *state)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(imc_chans); i++) {
+		if (!state->restore[i])
+			continue;
+		/*
+		 * Mask GO: the saved word is only meant to put the previous
+		 * address, register and TSOD state back, never to re-arm a
+		 * transaction that was already in flight when we found it.
+		 */
+		imc_set(s, imc_chans[i].data, state->command[i] & ~GO_BIT);
+		imc_reg(s, imc_chans[i].data);
+	}
+}
+
+static int imc_prepare_xfer(struct imc_smbus *s, const struct imc_chan *c,
+			    struct imc_xfer_state *state)
+{
+	int i, ret;
+
+	ret = imc_wait_engine_idle(s);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < ARRAY_SIZE(imc_chans); i++) {
+		state->command[i] = imc_reg(s, imc_chans[i].data);
+		state->restore[i] = i == c->idx ||
+				    (state->command[i] & TSOD_ACTIVE_BIT);
+		if (!(state->command[i] & TSOD_ACTIVE_BIT))
+			continue;
+
+		imc_set(s, imc_chans[i].data,
+			state->command[i] & COMMAND_KEEP_MASK);
+		imc_reg(s, imc_chans[i].data);
+		ret = imc_wait_go_clear(s, &imc_chans[i]);
+		if (ret) {
+			imc_restore_xfer(s, state);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+static int imc_access(struct imc_smbus *s, const struct imc_chan *c, u8 addr,
+		      u8 reg, char read_write, int size, u16 *value)
+{
+	struct imc_xfer_state state = {};
+	u32 command, expected, raw, status_pre, status = 0;
+	bool go_seen;
 	int ret;
 
-	ret = imc_wait_status(s, c);
+	ret = imc_prepare_xfer(s, c, &state);
 	if (ret)
 		return ret;
-	writel(FRAME | WORD_BIT | ((u32)addr << 8) | reg, s->cfg + c->data);
-	ret = imc_wait(s, c, &status);
-	if (ret) {
-		dev_warn_ratelimited(s->dev,
-				     "read word addr 0x%02x reg 0x%02x timed out\n",
-				     addr, reg);
-		return ret;
+
+	command = COMMAND_PREFIX | ((u32)addr << 8) | reg;
+	if (size == I2C_SMBUS_WORD_DATA)
+		command |= WORD_BIT;
+
+	if (read_write == I2C_SMBUS_WRITE) {
+		raw = size == I2C_SMBUS_WORD_DATA ? swab16(*value) : *value;
+		imc_set(s, c->ctrl, raw << 16);
+		imc_reg(s, c->ctrl);
+		command |= WRITE_OPERATION;
 	}
-	ret = imc_check_status(s, status, addr, reg);
+
+	status_pre = imc_reg(s, c->stat);
+	imc_set(s, c->data, command);
+	/* read back to flush the write and to see whether GO was accepted */
+	go_seen = imc_reg(s, c->data) & GO_BIT;
+
+	ret = imc_wait_transfer(s, c, &status);
 	if (ret)
-		return ret;
-	raw = readl(s->cfg + c->ctrl) & 0xFFFF;
-	*val = swab16(raw);
-	return 0;
+		goto restore_command;
+
+	if (!imc_engine_responded(go_seen, status_pre, status)) {
+		dev_warn_ratelimited(s->dev,
+				     "ch%d command not accepted for addr 0x%02x reg 0x%02x (stat 0x%08x unchanged, GO never seen)\n",
+				     c->idx, addr, reg, status);
+		ret = -ETIMEDOUT;
+		goto restore_command;
+	}
+
+	expected = read_write == I2C_SMBUS_WRITE ?
+		   STAT_WRITE_DONE : STAT_READ_DONE;
+	ret = imc_check_status(s, c, status, expected, addr, reg);
+	if (ret)
+		goto restore_command;
+
+	ret = imc_check_interference(s, c, &state);
+	if (ret)
+		goto restore_command;
+
+	if (read_write == I2C_SMBUS_READ) {
+		raw = imc_reg(s, c->ctrl);
+		*value = size == I2C_SMBUS_WORD_DATA ?
+			 swab16(raw & 0xffff) : raw & 0xff;
+	}
+
+restore_command:
+	imc_restore_xfer(s, &state);
+
+	return ret;
 }
 
 /*
@@ -349,45 +453,59 @@ static s32 imc_smbus_xfer(struct i2c_adapter *adap, u16 addr,
 {
 	struct imc_smbus *s = i2c_get_adapdata(adap);
 	const struct imc_chan *c = adap->algo_data;
-	u8 reg, val = 0;
+	u16 val = 0;
+	u8 reg;
 	int ret;
 
+	if (flags & I2C_M_TEN)
+		return -EAFNOSUPPORT;
 	if (addr > 0x7f)
 		return -EINVAL;
 
 	if (size != I2C_SMBUS_BYTE_DATA && size != I2C_SMBUS_WORD_DATA)
 		return -EOPNOTSUPP;
+	if (read_write != I2C_SMBUS_READ && read_write != I2C_SMBUS_WRITE)
+		return -EINVAL;
 
 	reg = command;
 
 	mutex_lock(&s->lock);
+	s->io_err = 0;
+
 	if (read_write == I2C_SMBUS_WRITE) {
 		if (size == I2C_SMBUS_WORD_DATA) {
 			dev_dbg(s->dev, "ch%d W addr=%02x reg=%02x val=%04x\n",
 				c->idx, addr, reg, data->word);
-			ret = imc_write_word(s, c, addr, reg, data->word);
+			val = data->word;
 		} else {
 			val = data->byte;
 			dev_dbg(s->dev, "ch%d W addr=%02x reg=%02x val=%02x\n",
 				c->idx, addr, reg, val);
-			ret = imc_write_byte(s, c, addr, reg, val);
 		}
+		ret = imc_access(s, c, addr, reg, read_write, size, &val);
 	} else {
+		ret = imc_access(s, c, addr, reg, read_write, size, &val);
 		if (size == I2C_SMBUS_WORD_DATA) {
-			u16 wval = 0;
-
-			ret = imc_read_word(s, c, addr, reg, &wval);
 			if (!ret)
-				data->word = wval;
+				data->word = val;
 			dev_dbg(s->dev, "ch%d R addr=%02x reg=%02x -> %04x (ret %d)\n",
-				c->idx, addr, reg, wval, ret);
+				c->idx, addr, reg, val, ret);
 		} else {
-			ret = imc_read_byte(s, c, addr, reg, &val);
 			if (!ret)
 				data->byte = val;
 			dev_dbg(s->dev, "ch%d R addr=%02x reg=%02x -> %02x (ret %d)\n",
 				c->idx, addr, reg, val, ret);
 		}
+	}
+
+	/*
+	 * A config-space failure invalidates whatever the transaction logic
+	 * concluded, so it wins over any other result.
+	 */
+	if (s->io_err) {
+		dev_warn_ratelimited(s->dev, "config access failed: %d\n",
+				     s->io_err);
+		ret = s->io_err;
 	}
 	mutex_unlock(&s->lock);
 
@@ -404,70 +522,68 @@ static const struct i2c_algorithm imc_algo = {
 	.functionality	= imc_func,
 };
 
-static void imc_mutex_destroy(void *data)
+static int imc_suspend(struct device *dev)
 {
-	struct mutex *lock = data;
+	struct imc_smbus *s = dev_get_drvdata(dev);
+	int i;
 
-	mutex_destroy(lock);
+	for (i = 0; i < ARRAY_SIZE(s->adap); i++)
+		i2c_mark_adapter_suspended(&s->adap[i]);
+
+	return 0;
 }
+
+static int imc_resume(struct device *dev)
+{
+	struct imc_smbus *s = dev_get_drvdata(dev);
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(s->adap); i++)
+		i2c_mark_adapter_resumed(&s->adap[i]);
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(imc_pm_ops, imc_suspend, imc_resume);
 
 static int imc_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
-	resource_size_t phys;
 	struct imc_smbus *s;
 	u8 imc_bus_hw;
-	u64 base;
 	u32 cfg0, cc;
 	int ret, i;
+
+	if (!allow_unsafe_access) {
+		dev_info(&pdev->dev,
+			 "firmware/SMM arbitration is unknown; set allow_unsafe_access=1 to bind\n");
+		return -ENODEV;
+	}
 
 	s = devm_kzalloc(&pdev->dev, sizeof(*s), GFP_KERNEL);
 	if (!s)
 		return -ENOMEM;
 
-	ret = pcim_enable_device(pdev);
-	if (ret) {
-		dev_err(&pdev->dev, "cannot enable PCI device: %d\n", ret);
-		return ret;
-	}
-
+	/*
+	 * No pci_enable_device(): the driver uses no BAR, no interrupt and no
+	 * DMA.  The engine is reached entirely through config space, which does
+	 * not require the function's memory or I/O decoding to be enabled.
+	 */
+	s->pdev = pdev;
 	s->dev = &pdev->dev;
-	mutex_init(&s->lock);
-	ret = devm_add_action_or_reset(&pdev->dev, imc_mutex_destroy, &s->lock);
+	pci_set_drvdata(pdev, s);
+	ret = devm_mutex_init(&pdev->dev, &s->lock);
 	if (ret)
 		return ret;
 
-	base = imc_detect_mmcfg_base(pdev);
-	if (!base) {
-		dev_err(&pdev->dev, "cannot resolve MMCONFIG base\n");
-		return -ENODEV;
+	ret = pci_mmcfg_read_config(pdev, CFG_VENDOR_DEV, 4, &cfg0);
+	if (ret) {
+		dev_err(&pdev->dev,
+			"no memory-mapped path to config space: %d\n", ret);
+		return ret;
 	}
-
-	phys = base +
-	       ((resource_size_t)pdev->bus->number   << 20) +
-	       ((resource_size_t)PCI_SLOT(pdev->devfn) << 15) +
-	       ((resource_size_t)PCI_FUNC(pdev->devfn) << 12);
-
-	if (phys < base || phys + CFG_SIZE < phys) {
-		dev_err(&pdev->dev, "ECAM address overflow\n");
-		return -EINVAL;
-	}
-
-	/*
-	 * Deliberately no request_mem_region(): the MMCONFIG window is already
-	 * claimed as a firmware/PCI resource, so a reservation would fail with
-	 * -EBUSY.  The pci_driver binding keeps the function alive; the registers
-	 * we drive are side-band controls the kernel does not otherwise touch.
-	 */
-	s->cfg = devm_ioremap_uc(&pdev->dev, phys, CFG_SIZE);
-	if (!s->cfg) {
-		dev_err(&pdev->dev, "ioremap(%pa) failed\n", &phys);
-		return -ENOMEM;
-	}
-
-	cfg0 = readl(s->cfg + CFG_VENDOR_DEV);
 	if (cfg0 != PCU_ID) {
-		dev_err(&pdev->dev, "wrong device at ECAM %pa (cfg[0]=0x%08x)\n",
-			&phys, cfg0);
+		dev_err(&pdev->dev, "wrong device through ECAM (cfg[0]=0x%08x)\n",
+			cfg0);
 		return -ENODEV;
 	}
 
@@ -476,10 +592,12 @@ static int imc_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	 * value: cfg[0xCC] bits[15:8] = the iMC SMBus bus number as seen by
 	 * the PCU.  On all known Skylake-X / Cascade Lake-X boards this matches
 	 * the probed bus number.
-	 * A mismatch means the ECAM walk landed on the wrong slot — warn but
+	 * A mismatch means the accessor landed on the wrong function - warn but
 	 * continue; the binding is already locked to 8086:2085.
 	 */
-	cc = readl(s->cfg + CFG_IMC_BUS);
+	ret = pci_mmcfg_read_config(pdev, CFG_IMC_BUS, 4, &cc);
+	if (ret)
+		return ret;
 	imc_bus_hw = (cc >> 8) & 0xFF;
 
 	if (imc_bus_hw && imc_bus_hw != (u8)pdev->bus->number)
@@ -491,8 +609,6 @@ static int imc_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 			"cfg[0xCC]=0x%08x iMC bus 0x%02x confirmed\n",
 			cc, imc_bus_hw);
 
-	dev_dbg(&pdev->dev, "ECAM mapped at %pa\n", &phys);
-
 	/*
 	 * Lifetime safety: the I2C core guarantees that smbus_xfer callbacks
 	 * are not invoked after i2c_del_adapter() returns. Since we use
@@ -501,17 +617,19 @@ static int imc_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	 */
 	for (i = 0; i < ARRAY_SIZE(s->adap); i++) {
 		struct i2c_adapter *a = &s->adap[i];
-		int n;
 
 		a->owner     = THIS_MODULE;
 		a->algo      = &imc_algo;
 		a->algo_data = (void *)&imc_chans[i];
 		a->dev.parent = &pdev->dev;
+		/*
+		 * One retry: interference from another master is reported as
+		 * -EAGAIN and is usually over by the next attempt.
+		 */
+		a->retries = 1;
 		i2c_set_adapdata(a, s);
-		n = snprintf(a->name, sizeof(a->name),
-			     "iMC SMBus Skylake-X channel %d", i);
-		if (n >= sizeof(a->name))
-			dev_warn(&pdev->dev, "adapter name truncated\n");
+		snprintf(a->name, sizeof(a->name),
+			 "iMC SMBus Skylake-X channel %d", i);
 
 		ret = devm_i2c_add_adapter(&pdev->dev, a);
 		if (ret) {
@@ -532,20 +650,21 @@ static const struct pci_device_id imc_pci_ids[] = {
 MODULE_DEVICE_TABLE(pci, imc_pci_ids);
 
 /*
- * All resources (ioremap, i2c adapters, mutex) are devm-managed and are
- * released automatically after probe returns or during device unbinding, so
- * no .remove callback is needed.  The register state is deliberately left
- * as-is on unbind: the engine carries no driver-private latched state that
- * needs teardown, and the SMBus controls we drive are side-band registers the
- * rest of the kernel does not touch.
+ * All resources (mutex, i2c adapters) are devm-managed and are released
+ * automatically after probe returns or during device unbinding, so no .remove
+ * callback is needed.  The register state is deliberately left as-is on
+ * unbind: the engine carries no driver-private latched state that needs
+ * teardown, and the SMBus controls we drive are side-band registers the rest
+ * of the kernel does not touch.
  */
 static struct pci_driver imc_driver = {
 	.name     = "i2c-imc-skylake",
 	.id_table = imc_pci_ids,
 	.probe    = imc_pci_probe,
+	.driver.pm = pm_sleep_ptr(&imc_pm_ops),
 };
 module_pci_driver(imc_driver);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Simone Chifari");
-MODULE_DESCRIPTION("Intel Skylake-X iMC SMBus I2C adapter (ECAM MMIO)");
+MODULE_DESCRIPTION("Intel Skylake-X iMC SMBus I2C adapter");

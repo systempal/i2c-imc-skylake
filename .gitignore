@@ -51,6 +51,8 @@ docs/archive-i2c-imc-driver-plan.md
 docs/archive-v3-review-fixes.md
 docs/submission/submission-instructions.md
 docs/submission/review-answers.md
+docs/submission/v3-readiness-audit.md
+docs/submission/v4-review-360.md
 
 # Private Gitea CI (replaced by .github/workflows/ for public repo)
 .gitea/

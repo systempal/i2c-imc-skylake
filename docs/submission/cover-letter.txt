@@ -1,120 +1,186 @@
-Subject: [PATCH v3 0/1] i2c: imc-skylake: add Intel Skylake-X iMC SMBus adapter
+Subject: [RFC PATCH v4 0/2] i2c: imc-skylake: Intel Skylake-X iMC SMBus adapter
 
-This is v3 of the i2c-imc-skylake driver.  v2 was submitted under the name
-i2c-imc-x299; the driver has been renamed to reflect that the iMC SMBus
-engine is in the Skylake-X / Cascade Lake-X CPU, not in the X299 chipset.
+This series exposes the two SMBus channels of the integrated memory
+controller of Intel Skylake-X and Cascade Lake-X processors as standard
+Linux I2C adapters, so that DDR4 SPD EEPROMs and DIMM thermal sensors can
+be read with i2c-tools, decode-dimms and lm-sensors.
 
-This series adds a driver for the integrated memory controller (iMC) SMBus
-engine on Intel Skylake-X / Cascade Lake-X processors (socket LGA 2066,
-platform X299, PCU function 8086:2085).
+v3 was never posted. v2 was posted as i2c-imc-x299 and received no replies:
 
-The engine provides two SMBus channels — one per pair of DIMM slots — over
-which SPD EEPROMs, DDR4 thermal sensors and third-party LED controllers
-(e.g. ENE KB9012 at 0x27) are accessible.  Exposing it as a pair of standard
-Linux I2C adapters lets existing tools (i2c-tools, lm-sensors) use
-it without bespoke sysfs hacks.
+  https://lore.kernel.org/linux-i2c/20260620144131.415559-1-simone.chifari@gmail.com/
 
-Why ECAM MMIO instead of pci_{read,write}_config_dword
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-On X299 the kernel selects "configuration type 1" (CF8/CFC port I/O) for PCI
-config space access, as reported by boot-time dmesg:
+Patch 1 is a PCI/x86 change and is the reason this is still an RFC.
+Patch 2 is the driver and depends on patch 1.
 
-  PCI: Using configuration type 1 for base access
+  1/2  PCI: allow config access forced through the memory-mapped path
+  2/2  i2c: imc-skylake: add driver for the Intel Skylake-X iMC SMBus engine
 
-System Management Mode traps writes to those ports for this device, so a
-standard pci_write_config_dword() targeting the SMBus DATA register never
-reaches the hardware — the GO bit never clears and the transaction never
-completes.
-The Windows NTIOLib (used by Kingston FURY) reaches the same registers via the
-ECAM (MMIO) window, which is not trapped.  This driver follows the same path:
-ioremap() of the ECAM page for the target function and driving the registers
-by MMIO read/write.
+Why patch 1 exists
+~~~~~~~~~~~~~~~~~~
+The engine's registers are at config space offsets 0x9C-0xB8, inside the
+first 256 bytes. On x86, raw_pci_read()/raw_pci_write() dispatch that range
+to raw_pci_ops, which is CF8/CFC whenever configuration type 1 is usable
+(arch/x86/pci/common.c). The extended path, raw_pci_ext_ops, is only
+consulted from offset 0x100 upwards.
 
-Note that pci_mmcfg_* helpers are arch-internal and not exported to modules,
-so a manual walk of the ACPI MCFG table is used to locate mmcfg_base at probe
-time (no module parameter, no hardcoding).
+On the tested board a dword written to the command register through
+CF8/CFC does not take effect: the register reads back unchanged, the GO bit
+is never consumed and no SMBus transaction is issued. The same write through
+the ECAM window works, and that is how the register layout was confirmed.
 
-Relation to prior iMC SMBus work
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Two previous attempts to upstream an iMC SMBus driver exist:
+This is not only a problem for this driver. If CF8/CFC writes to that
+function are dropped, then setpci, sysfs and anything else the kernel does
+to its low config space is equally unreliable. So rather than have a leaf
+driver map the ECAM page itself, patch 1 adds
 
-  - Lutomirski 2013–2016 (Sandy Bridge-EP 8086:3ca8): used CF8/CFC
-    pci_read/write_config_dword — correct on that platform since SMM does not
-    trap those ports on Sandy Bridge-EP.  Not merged due to missing bus
-    arbitration (BMC / CLTT sharing) and a required allow_unsafe_access flag.
+  int pci_mmcfg_read_config(struct pci_dev *, int where, int size, u32 *val);
+  int pci_mmcfg_write_config(struct pci_dev *, int where, int size, u32 val);
 
-  - schaecsn 2020 (Broadwell-E 8086:6fa8): added TSOD arbitration using the
-    Broadwell-documented tsod_polling_interval quiesce procedure.  Not merged
-    (no reviewer response); register layout differs from X299.
+in drivers/pci/access.c, taking pci_lock and honouring
+pci_cfg_access_lock(), on top of a weak arch_pci_mmcfg_access() hook that
+x86 implements over the already-validated pci_mmcfg_list. No MCFG re-parsing
+and no second mapping of a window the architecture has already mapped.
 
-This driver is for a different device ID (0x2085), different register layout
-(DATA/STATUS/CTRL at 0x9C-0xB8 vs 0x180-0x188), and a fundamentally different
-access method (ECAM ioremap).  Combining it with the Lutomirski/schaecsn code
-would require a large per-generation hw_data table with mutually incompatible
-access methods; a separate file is cleaner.
+Questions for the PCI and x86 maintainers:
 
-The X299 HEDT (High-End Desktop) platform has no BMC and no CLTT firmware
-polling, so the arbitration safety concern of the Lutomirski patch does not
-apply.  No allow_unsafe_access flag is needed.
+  - is an explicit per-access opt-in the right shape, or should a platform
+    that filters CF8/CFC for a function be handled by a quirk that redirects
+    all of its config accesses?
+  - if a helper is right, is drivers/pci/access.c plus a weak arch hook the
+    right place, or should this live entirely in arch/x86?
 
-Independent validation
+I do not consider patch 1 settled and will rework it in whatever direction
+you point.
+
+What causes the dropped write is not known. Earlier revisions of this
+driver attributed it to System Management Mode; the only evidence for that
+was the boot log line naming the access method, which says nothing about
+who filters the write, so the attribution has been removed everywhere. The
+observation stands on its own: the write does not reach the register.
+
+Firmware arbitration
+~~~~~~~~~~~~~~~~~~~~
+This is the reason no iMC SMBus driver has ever been merged, and this
+series does not solve it either.
+
+Andy Lutomirski's original i2c_imc put it plainly: a BMC, the memory
+controller's power management, and possibly SMM all like to touch this bus,
+and Intel defined no way to arbitrate between them. That driver already had
+a module parameter called allow_unsafe_access. Stefan Schaeckeler's 2020
+Broadwell rewrite went further and stopped the PCU's TSOD polling for the
+duration of a transfer (write 0 to TSODCNTL, wait 10 ms for in-flight
+transactions to drain, restore afterwards), because on Broadwell the
+original driver's consistency check tripped about every 30 minutes.
+
+  https://lwn.net/Articles/635898/
+  https://lore.kernel.org/linux-i2c/1582498270-50674-1-git-send-email-schaecsn@gmx.net/
+
+So this driver:
+
+  - keeps the default-off allow_unsafe_access gate, deliberately the same
+    name as the original;
+  - serializes both channels under one mutex and waits for the whole engine
+    to be idle before touching any register;
+  - saves the command state of both channels, clears TSOD_ACTIVE for the
+    duration of the transfer, and restores both afterwards;
+  - after every transfer compares the command registers against what it
+    left in them and fails the transfer with -EAGAIN if anything else
+    changed. This is the check the original driver had, and it is what makes
+    an unarbitrated system detectable rather than silently wrong;
+  - requires a positive sign that the engine acted on the command, because
+    the done bits are latched: without that, a command that is never
+    accepted is indistinguishable from a completed one and the caller would
+    receive the previous transaction's data.
+
+What is missing: no equivalent of Broadwell's TSODCNTL has been identified
+on this part, so a system with CLTT enabled is expected to trip the
+interference check rather than be arbitrated against. Finding that register
+is the main open item. I would rather ship a driver that detects the
+condition and refuses than one that quietly races.
+
+Relation to prior work
 ~~~~~~~~~~~~~~~~~~~~~~
-The register layout (DATA/STATUS/CTRL at 0x9C-0xB8, stride 4, GO bit 19,
-WORD bit 17) was independently reverse-engineered and confirmed by the
-PawnIO.Modules project (SmbusIntelSkylakeIMC.p, Windows userspace, Feb 2026)
-and by commercial monitoring tools (HWiNFO, SIV) that access the same PCI
-config space via the Windows kernel API (ECAM by default on this platform).
+There is no iMC I2C driver in mainline. Lutomirski's i2c-imc was an RFC;
+the 2020 resend and github.com/Linux4/i2c-imc are out of tree. Neither can
+be extended to cover this part: the device ID (0x2085 vs 0x3ca8/0x6fa8),
+the register layout (0x9C-0xB8 vs 0x180-0x188) and the working access
+method all differ. A separate file is cleaner than a hw_data table with
+mutually exclusive access paths.
+
+The register encoding was cross-checked against an independent Windows
+implementation for the same engine, which predates this work:
+
+  https://github.com/namazso/PawnIO.Modules/blob/c975ca1d1b8a9c7473a175fa1ca24d83b6cbc8f3/SmbusIntelSkylakeIMC.p
+
+It also implements SMBus BYTE through a pointer-select bit. That is not
+advertised here because it has not been validated on the Linux system, so
+i2cdetect cannot scan these buses; devices are addressed directly.
 
 Changes since v2
-~~~~~~~~~~~~~~~~~
-  - Rename driver from i2c-imc-x299 to i2c-imc-skylake
-  - Fix iMC SMBus attribution: engine is in the CPU (Skylake-X), not
-    the X299 chipset
-  - Add I2C_SMBUS_WORD_DATA support (WORD_BIT bit 17) for TSOD reads
-  - Update adapter name: "iMC SMBus Skylake-X channel N"
-  - Use devm_ioremap_uc() for the ECAM mapping (uncached, strongly
-    ordered) instead of devm_ioremap()
-  - Use ARRAY_SIZE() for the adapter loop; initialise wval on the
-    word-read path
-  - Build FRAME from named bits (ENGINE_ENABLE | GO_BIT) instead of a
-    magic constant; document the CTRL/DATA/STATUS encoding in full
-  - Cross-check the iMC bus number against cfg[0xCC] at probe
-  - Kconfig: depends on PCI && ACPI && (X86_64 || COMPILE_TEST); drop
-    the CONFIG_ACPI fallback stub accordingly
-  - Quiet probe: demote informational probe messages to dev_dbg()
+~~~~~~~~~~~~~~~~
+  - Split into a PCI/x86 patch and the driver; the driver no longer walks
+    the MCFG table or maps the ECAM page itself.
+  - Rename i2c-imc-x299 to i2c-imc-skylake; the engine is in the CPU, not
+    the chipset.
+  - Add the default-off allow_unsafe_access gate.
+  - Wait for both channels to be idle before touching the data latch.
+  - Preserve and restore command and TSOD state for both channels.
+  - Validate READ_DONE, WRITE_DONE and the hardware error state.
+  - Detect interference from another master and report it as -EAGAIN.
+  - Require a positive sign that a command was accepted.
+  - Add bounded command-toggle recovery for a stuck BUSY state.
+  - Add WORD_DATA support with the hardware byte ordering.
+  - Reject I2C_M_TEN explicitly and validate transfer direction.
+  - Use the i2c core's suspended-adapter mechanism instead of a private
+    flag and a non-standard errno.
+  - Use devm_mutex_init() and devm-managed adapters; drop the unnecessary
+    pci_enable_device().
+  - Add Documentation/i2c/busses/i2c-imc-skylake.rst.
+  - Drop the ACPI dependency; the Kconfig entry now depends on PCI_MMCONFIG.
+  - Remove the unsupported attribution of the dropped write to SMM.
 
-Testing
-~~~~~~~
-Tested on: Intel X299 platform (Skylake-X CPU), 4× DDR4 DIMMs,
-kernel 7.0.0-14-generic (Linux Mint 22.3).
+Validation
+~~~~~~~~~~
+  - In-tree build of both patches, W=1, x86_64, GCC: no diagnostics.
+  - arm64 COMPILE_TEST with Clang: no diagnostics.
+  - checkpatch.pl --strict: clean on both patches.
+  - Sparse with __CHECK_ENDIAN__: clean.
+  - Read-only hardware test on one Intel X299 system with four DDR4 DIMMs:
+    both adapters, four SPD EEPROMs, BYTE_DATA, WORD_DATA byte order, ENXIO
+    for an absent device, 100 concurrent reads per channel, the default-off
+    gate, and 20 unload/reload cycles, with no kernel warning or oops, no
+    interference reported and every command accepted.
 
-  $ i2cdetect -l | grep iMC
-  i2c-7   smbus   iMC SMBus Skylake-X channel 0   SMBus adapter
-  i2c-8   smbus   iMC SMBus Skylake-X channel 1   SMBus adapter
+Still required before this can lose the RFC prefix: an independent
+Tested-by, ideally on Cascade Lake-X; suspend/resume with active clients;
+a measurement of MSR_SMI_COUNT across a failing CF8/CFC write, to say
+something about the mechanism rather than only about the effect; and a
+direction from the PCI and x86 maintainers on patch 1.
 
-The driver supports SMBus BYTE_DATA and WORD_DATA transfers.  WORD_DATA
-uses the engine's WORD_BIT (bit 17) and is needed for DDR4 thermal sensors
-(TSOD) which expose 16-bit temperature registers.  The engine stores word
-data in little-endian order in the CTRL register, so byte-swapping is applied
-on both read and write paths.
+Tool assistance
+~~~~~~~~~~~~~~~
+Per Documentation/process/generated-content.rst: this work was developed
+with an AI coding assistant, run interactively rather than autonomously.
 
-Since the hardware requires a register offset for every transaction,
-I2C_SMBUS_QUICK and I2C_SMBUS_BYTE (which have no offset) are not supported
-(returning -EOPNOTSUPP).  For the same reason i2cdetect cannot scan the bus;
-access a device directly with a byte-data read, e.g. `i2cget -y <bus> 0x50 0x02`
-reads SPD byte 2.  Standard kernel drivers such as ee1004 (for DDR4 SPD) load
-and bind successfully via BYTE_DATA reads.
+  - What: Claude Code, model claude-opus-5.
+  - Where: it contributed to the transaction state machine of patch 2, the
+    kerneldoc and .rst documentation, the commit messages and this cover
+    letter. The register decoding, the ECAM finding and every hardware
+    measurement are mine.
+  - How it was used: iteratively, one reviewed change at a time, in
+    response to specific requests, not from a single generating prompt. A
+    representative request is "the done bits are latched; show me how a
+    command that is never accepted can be mistaken for a completed one, and
+    make that case detectable", which produced the check now in
+    imc_engine_responded().
+  - Testing: every revision was built with W=1, checked with
+    checkpatch --strict and sparse, and the hardware behaviour was tested
+    on the X299 system by me.
 
-udev autoloads the module on PCI add event (MODULE_DEVICE_TABLE present).
-20 rmmod/modprobe cycles: no oops, no warnings, no resource leaks in dmesg.
+I have reviewed all of it, I understand it, and I take responsibility for
+it. The Assisted-by trailer is on patch 2, which is where the assistance
+went; patch 1 was written by hand from the existing arch/x86 code.
 
----
-
-Simone Chifari (1):
-  i2c: imc-skylake: add driver for Intel Skylake-X iMC SMBus engine
-
- MAINTAINERS                          |    6 +
- drivers/i2c/busses/Kconfig           |   19 +
- drivers/i2c/busses/Makefile          |    1 +
- drivers/i2c/busses/i2c-imc-skylake.c |  551 +++++++++++++++++++++++++++++++++
- 4 files changed, 577 insertions(+)
+Simone Chifari (2):
+  PCI: allow config access forced through the memory-mapped path
+  i2c: imc-skylake: add driver for the Intel Skylake-X iMC SMBus engine
