@@ -106,7 +106,14 @@ implementation for the same engine, which predates this work:
 
 It also implements SMBus BYTE through a pointer-select bit.  That is not
 advertised here because it has not been validated on the Linux system, so
-i2cdetect cannot scan these buses; devices are addressed directly.
+i2cdetect cannot scan these buses and devices are addressed directly.
+
+That omission costs more than the scan.  Both functionality combinations
+ee1004 accepts include I2C_FUNC_SMBUS_BYTE, so ee1004 does not bind to this
+adapter and decode-dimms does not work through it; SPD bytes are readable
+with i2cget, and jc42 binds fine where a sensor is populated.  Implementing
+Receive Byte is the most useful thing still missing, and I would rather add
+it in a follow-up, validated, than advertise it now.
 
 Changes since v2
 ~~~~~~~~~~~~~~~~
@@ -131,6 +138,8 @@ Changes since v2
   - Add Documentation/i2c/busses/i2c-imc-skylake.rst.
   - Drop the ACPI dependency.
   - Refuse to bind when the iMC reports TSOD polling enabled.
+  - Correct the claim that BYTE_DATA and WORD_DATA cover ee1004: they do
+    not, ee1004 also needs Receive Byte.
 
 Validation
 ~~~~~~~~~~
@@ -145,8 +154,23 @@ Validation
     checks, 0 failures, no kernel warning or oops, no interference
     reported, every command word confirmed in the register.
   - Engine registers sampled every 2 s for one hour with the driver
-    unloaded: 1791 samples, 0 changes.  No firmware activity was observed
-    on this system.
+    unloaded: 1791 samples, 0 changes.  No firmware activity while the
+    system is up.
+  - Suspend and resume, s2idle and S3, with continuous traffic on both
+    adapters: transfers recover and nothing complains.  Across S3 the
+    firmware demonstrably drives the engine.  Both channels, sampled
+    immediately before suspend and immediately after resume:
+
+      DATA   0x2000b600 -> 0x20005000
+      STATUS 0x0000500c -> 0x00005004
+
+    The command word came back addressing SPD 0x50 for a read, and the
+    status went from both done bits latched to READ_DONE alone.  Nothing in
+    Linux issued that: the adapter was marked suspended and userspace was
+    frozen.  This is consistent with firmware reading SPD during memory
+    training on resume.  It is the only direct observation of a second
+    master on this engine I have, and it is the concrete reason the driver
+    restores command state per transfer and compares it afterwards.
   - SMBCNTL on all four iMC channels reads 0xac000000: TSOD polling
     disabled, TSOD_PRESENT empty.
   - Writes validated end to end against a populated device: a 12-write
@@ -158,7 +182,7 @@ Validation
     after.
 
 Still missing: an independent Tested-by, ideally on Skylake-X rather than
-Cascade Lake-X, and suspend/resume testing with active I2C clients.
+Cascade Lake-X, and SMBus Receive Byte so that ee1004 binds.
 
 One note on the register interface, since a reader with the datasheet will
 ask.  That document describes an SMBus interface on the iMC channel

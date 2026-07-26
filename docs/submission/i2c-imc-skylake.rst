@@ -91,7 +91,13 @@ Supported transactions
 ----------------------
 
 The driver implements SMBus Read/Write Byte Data and Read/Write Word Data.
-That covers ee1004 (DDR4 SPD) and jc42 (TSOD).
+
+That is enough for ``jc42`` (TSOD), which asks for exactly those two.  It is
+**not** enough for ``ee1004``: both of its accepted combinations include
+``I2C_FUNC_SMBUS_BYTE``, which this adapter does not implement, so the driver
+probe fails with ``-EPFNOSUPPORT``.  SPD bytes are still readable directly with
+``i2cget``.  Implementing SMBus Receive Byte would make ``ee1004`` and
+``decode-dimms`` work; it is the most useful thing still missing.
 
 SMBus Quick and Receive Byte are not implemented, so ``i2cdetect`` cannot scan
 these buses.  Address a device directly instead, for example SPD byte 2 of the
@@ -110,15 +116,18 @@ Word transfers use the standard SMBus byte order, so ``jc42`` reading through
 Instantiating clients
 ---------------------
 
-The adapter does not create ``ee1004`` or ``jc42`` clients by itself.  There is
-no firmware description of these buses and the driver does not scan.  Create
-them explicitly if you want them::
+The adapter does not create clients by itself.  There is no firmware
+description of these buses and the driver does not scan.
 
-    # echo ee1004 0x50 > /sys/bus/i2c/devices/i2c-6/new_device
-    # echo jc42 0x18   > /sys/bus/i2c/devices/i2c-6/new_device
+``jc42`` can be instantiated where a thermal sensor is populated::
 
-Check first that the address is not already bound to a driver.
+    # echo jc42 0x18 > /sys/bus/i2c/devices/i2c-6/new_device
 
+Whether one is populated is visible in ``SMBCNTL.TSOD_PRESENT``; on the
+development system that mask is empty and no ``jc42`` binds.
+
+``ee1004`` will not bind for the reason given above.  Read SPD bytes directly
+instead.
 
 Module parameters
 -----------------
