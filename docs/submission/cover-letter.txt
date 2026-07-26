@@ -149,16 +149,16 @@ Validation
     on this system.
   - SMBCNTL on all four iMC channels reads 0xac000000: TSOD polling
     disabled, TSOD_PRESENT empty.
-  - Write transactions reach the bus: a byte write to an unpopulated
-    address returns -ENXIO with the engine reporting the address NACK, so
-    the write path is issued rather than suppressed.  An end-to-end write
-    to a populated device is not part of this validation; the only
-    non-SPD device on the test system is an LED controller whose reads are
-    themselves unreliable, and SPD writes were out of scope.
+  - Writes validated end to end against a populated device: a 12-write
+    frame to an LED controller at 0x27, across both channels, every write
+    acknowledged, no NACK, and the device applied the result.  A byte
+    write to an unpopulated address returns -ENXIO with the engine
+    reporting the address NACK.  No SPD was written at any point, and the
+    four SPD EEPROMs were verified present with valid CRCs before and
+    after.
 
 Still missing: an independent Tested-by, ideally on Skylake-X rather than
-Cascade Lake-X, suspend/resume testing with active I2C clients, and an
-end-to-end write to a populated device.
+Cascade Lake-X, and suspend/resume testing with active I2C clients.
 
 One note on the register interface, since a reader with the datasheet will
 ask.  That document describes an SMBus interface on the iMC channel
