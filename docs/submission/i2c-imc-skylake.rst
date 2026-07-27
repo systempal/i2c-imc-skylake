@@ -129,22 +129,27 @@ Word transfers use the standard SMBus byte order, so ``jc42`` reading through
 Instantiating clients
 ---------------------
 
-The adapter does not create clients by itself.  There is no firmware
-description of these buses and the driver does not scan.
+SPD EEPROMs are instantiated at probe with ``i2c_register_spd()``, like the
+other SMBus host drivers.  It counts the populated slots from DMI and probes
+from 0x50 upwards, so an address that does not answer is left alone.  Each
+channel carries half the DIMMs and the scan runs per adapter, so each finds
+its own::
 
-``jc42`` can be instantiated where a thermal sensor is populated::
+    i2c i2c-6: Successfully instantiated SPD at 0x50
+    ee1004 6-0050: 512 byte EE1004-compliant SPD EEPROM, read-only
+
+``decode-dimms`` therefore works with no manual step.
+
+Nothing else is instantiated: there is no firmware description of these buses
+and the driver does not scan for anything but the SPDs.  ``jc42`` has to be
+added by hand where a thermal sensor is populated::
 
     # echo jc42 0x18 > /sys/bus/i2c/devices/i2c-6/new_device
 
 Whether one is populated is visible in ``SMBCNTL.TSOD_PRESENT``; on the
 development system that mask is empty and no ``jc42`` binds.
 
-``ee1004`` binds on each populated SPD address::
-
-    # echo ee1004 0x50 > /sys/bus/i2c/devices/i2c-6/new_device
-    ee1004 6-0050: 512 byte EE1004-compliant SPD EEPROM, read-only
-
-Two things are worth knowing before instantiating it on this bus.
+Two things about the SPDs are worth knowing on this bus.
 
 A DDR4 SPD is a 512-byte array reached through a 256-byte window, and which
 half is visible is a property of the bus, not of the transfer.  ``ee1004``
@@ -154,11 +159,14 @@ reading SPD by hand::
 
     # i2cset -y 6 0x36 0x00 c
 
-And a bound ``ee1004`` owns those addresses, so userspace can no longer reach
-them through ``/dev/i2c-*``.  That matters more here than on a mainboard SMBus,
-because the tools that motivate this driver share the bus with the SPDs.  Bind
-``ee1004`` when you want ``decode-dimms``, and remove it when you want the
-addresses back::
+And ``ee1004`` owns those addresses once bound, so userspace cannot reach them
+through ``/dev/i2c-*`` any more.  This is ordinary I2C behaviour, but it is
+worth stating here because the userspace tools that motivate this driver share
+the bus with the SPDs.  Read the SPD through the driver instead::
+
+    $ cat /sys/bus/i2c/drivers/ee1004/6-0050/eeprom | hexdump -C
+
+or, if an address really is needed raw, release it::
 
     # echo 0x50 > /sys/bus/i2c/devices/i2c-6/delete_device
 

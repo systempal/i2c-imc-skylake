@@ -4,6 +4,7 @@ set -euo pipefail
 
 PASS=0
 FAIL=0
+SKIP=0
 CH0=""
 CH1=""
 CH0_ADDR=""
@@ -51,6 +52,16 @@ _fail()
 {
 	echo "FAIL: $*"
 	((FAIL++)) || true
+}
+
+# A check that could not run is not a check that passed. Several below are
+# guarded on an SPD address having been found, and when that lookup failed they
+# used to vanish from the run silently, leaving a shorter suite reporting
+# "0 failed" — which is how a regression hides.
+_skip()
+{
+	echo "SKIP: $*"
+	((SKIP++)) || true
 }
 
 _module_loaded()
@@ -200,6 +211,43 @@ _load_unsafe()
 	"${SUDO[@]}" insmod "$MODULE_PATH" allow_unsafe_access=1
 }
 
+# The driver instantiates ee1004 on the populated SPD addresses at probe, and
+# the checks below need those addresses raw. Unbind rather than delete: the
+# sysfs delete_device only removes clients that sysfs new_device created, while
+# i2c_register_spd() uses i2c_new_scanned_device(). Unbinding is enough anyway,
+# because i2c-dev refuses an address only while a driver is *bound* to it
+# (i2cdev_check: `return dev->driver ? -EBUSY : 0`).
+SPD_UNBOUND=()
+
+_unbind_spd_clients()
+{
+	local dev name
+
+	for dev in /sys/bus/i2c/drivers/ee1004/*-*; do
+		[[ -e "$dev" ]] || continue
+		name=${dev##*/}
+		[[ "$name" == "$CH0-"* || "$name" == "$CH1-"* ]] || continue
+		if printf '%s\n' "$name" |
+			"${SUDO[@]}" tee /sys/bus/i2c/drivers/ee1004/unbind >/dev/null 2>&1; then
+			SPD_UNBOUND+=("$name")
+		fi
+	done
+	echo "unbound ${#SPD_UNBOUND[@]} SPD client(s) for the raw transaction checks"
+}
+
+# Put them back if the run ends early. On a clean run the reload cycles below
+# have already recreated and rebound them, so these writes just fail harmlessly.
+_rebind_spd_clients()
+{
+	local name
+
+	for name in ${SPD_UNBOUND[@]+"${SPD_UNBOUND[@]}"}; do
+		printf '%s\n' "$name" |
+			"${SUDO[@]}" tee /sys/bus/i2c/drivers/ee1004/bind >/dev/null 2>&1 || true
+	done
+}
+trap _rebind_spd_clients EXIT
+
 DMESG_START=$("${SUDO[@]}" dmesg | wc -l)
 "${SUDO[@]}" modprobe i2c-dev
 _module_loaded && "${SUDO[@]}" rmmod i2c-imc-skylake
@@ -209,6 +257,15 @@ echo "=== adapter discovery ==="
 _refresh_buses
 [[ -n "$CH0" ]] && _ok "ch0 adapter at i2c-$CH0" || _fail "ch0 adapter not found"
 [[ -n "$CH1" ]] && _ok "ch1 adapter at i2c-$CH1" || _fail "ch1 adapter not found"
+
+# The driver instantiates SPD clients at probe. Prove it did, then take the
+# addresses back so the raw transaction checks can use them.
+_spd_clients=$(ls -d /sys/bus/i2c/drivers/ee1004/"$CH0"-00* \
+	/sys/bus/i2c/drivers/ee1004/"$CH1"-00* 2>/dev/null | wc -l)
+((_spd_clients > 0)) &&
+	_ok "driver instantiated $_spd_clients SPD EEPROM(s) at probe" ||
+	_fail "no SPD EEPROM instantiated at probe"
+_unbind_spd_clients
 
 if [[ -n "$CH0" ]]; then
 	_scan_spd "$CH0" CH0_ADDR && _ok "SPD device present on ch0" || _fail "no SPD device on ch0"
@@ -220,30 +277,41 @@ fi
 echo "=== transfer semantics ==="
 if [[ -n "$CH0_ADDR" ]]; then
 	_word_test "$CH0" "$CH0_ADDR" && _ok "WORD_DATA byte order on ch0" || _fail "WORD_DATA test on ch0"
+else
+	_skip "WORD_DATA on ch0: no reachable SPD address"
 fi
 if [[ -n "$CH1_ADDR" ]]; then
 	_word_test "$CH1" "$CH1_ADDR" && _ok "WORD_DATA byte order on ch1" || _fail "WORD_DATA test on ch1"
-
+else
+	_skip "WORD_DATA on ch1: no reachable SPD address"
 fi
 if [[ -n "$CH0_ADDR" ]]; then
 	_receive_byte_test "$CH0" "$CH0_ADDR" &&
 		_ok "Receive Byte follows the EEPROM pointer on ch0" ||
 		_fail "Receive Byte test on ch0"
+else
+	_skip "Receive Byte follows the EEPROM pointer on ch0: no reachable SPD address"
 fi
 if [[ -n "$CH1_ADDR" ]]; then
 	_receive_byte_test "$CH1" "$CH1_ADDR" &&
 		_ok "Receive Byte follows the EEPROM pointer on ch1" ||
 		_fail "Receive Byte test on ch1"
+else
+	_skip "Receive Byte follows the EEPROM pointer on ch1: no reachable SPD address"
 fi
 if [[ -n "$CH0_ADDR" ]]; then
 	_send_byte_test "$CH0" "$CH0_ADDR" &&
 		_ok "Send Byte selects the SPD page on ch0" ||
 		_fail "Send Byte test on ch0"
+else
+	_skip "Send Byte selects the SPD page on ch0: no reachable SPD address"
 fi
 if [[ -n "$CH1_ADDR" ]]; then
 	_send_byte_test "$CH1" "$CH1_ADDR" &&
 		_ok "Send Byte selects the SPD page on ch1" ||
 		_fail "Send Byte test on ch1"
+else
+	_skip "Send Byte selects the SPD page on ch1: no reachable SPD address"
 fi
 if [[ -n "$CH0" ]]; then
 	_nack_test "$CH0" && _ok "absent-device ENXIO on ch0" || _fail "expected ENXIO at address 0x77 on ch0"
@@ -325,5 +393,9 @@ else
 	_ok "every command reached the register"
 fi
 
-echo "=== result: $PASS passed, $FAIL failed ==="
+if ((SKIP)); then
+	echo "=== result: $PASS passed, $FAIL failed, $SKIP skipped ==="
+else
+	echo "=== result: $PASS passed, $FAIL failed ==="
+fi
 ((FAIL == 0))

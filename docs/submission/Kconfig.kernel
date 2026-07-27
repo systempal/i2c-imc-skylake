@@ -1,6 +1,7 @@
 config I2C_IMC_SKYLAKE
 	tristate "Intel Skylake-X iMC SMBus adapter"
 	depends on PCI && (X86_64 || COMPILE_TEST)
+	select I2C_SMBUS
 	help
 	  Say Y here if you want kernel support for the integrated memory
 	  controller (iMC) SMBus engine found in Intel Skylake-X / Cascade
@@ -10,6 +11,8 @@ config I2C_IMC_SKYLAKE
 	  Two I2C adapters are registered, one per hardware SMBus channel,
 	  allowing access to DDR4 DIMM SPD EEPROMs (0x50-0x57) and thermal
 	  sensors from userspace via standard i2c-tools and lm-sensors.
+	  SPD EEPROMs are instantiated automatically from DMI, so decode-dimms
+	  works without any manual step.
 
 	  Firmware, SMM, a BMC or CLTT may drive the same engine and no
 	  generic arbitration mechanism is known.  The driver therefore
