@@ -2,6 +2,16 @@ obj-m := i2c-imc-skylake.o
 
 KVER   ?= $(shell uname -r)
 KDIR   ?= /lib/modules/$(KVER)/build
+
+# Out-of-tree only. The driver targets current mainline and calls
+# i2c_register_spd_write_disable(); older kernels have the unsplit
+# i2c_register_spd(). compat.h bridges that, force included here so
+# i2c-imc-skylake.c is exactly the file sent upstream. Detected from the target
+# kernel's header rather than from a version number, which keeps it right on
+# backported and vendor trees.
+SPD_SPLIT := $(shell grep -qs i2c_register_spd_write_disable \
+	$(KDIR)/include/linux/i2c-smbus.h && echo -DHAVE_I2C_REGISTER_SPD_SPLIT)
+ccflags-y += -include $(src)/compat.h $(SPD_SPLIT)
 INSTALL_MOD_PATH ?= $(DESTDIR)
 INSTALL_MOD_DIR  ?= updates
 PWD    := $(shell pwd)

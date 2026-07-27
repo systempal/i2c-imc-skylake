@@ -47,6 +47,7 @@
 #include <linux/bits.h>
 #include <linux/delay.h>
 #include <linux/i2c.h>
+#include <linux/i2c-smbus.h>
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -680,6 +681,22 @@ static int imc_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 				"i2c_add_adapter ch%d failed: %d\n", i, ret);
 			return ret;
 		}
+
+		/*
+		 * Instantiate the SPD EEPROMs the same way the other SMBus
+		 * host drivers do.  This counts the populated slots from DMI
+		 * and probes 0x50 upwards, so no client is created for an
+		 * address that does not answer and userspace keeps the ones
+		 * that stay empty.  Each channel carries half the DIMMs, and
+		 * the scan is per adapter, so each finds its own.
+		 *
+		 * The write_disable variant: this part is DDR4 only, where the
+		 * two differ in nothing (the distinction gates spd5118 on
+		 * DDR5).  Where they are equivalent, the one that does not
+		 * suggest this driver enables SPD writes is the better name to
+		 * leave in a memory-bus driver.
+		 */
+		i2c_register_spd_write_disable(a);
 	}
 
 	dev_dbg(&pdev->dev, "registered 2 SMBus channels\n");

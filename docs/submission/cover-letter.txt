@@ -124,6 +124,22 @@ ee1004 consequently binds, and decode-dimms reads all four DIMMs on this
 system with both SPD CRCs valid on each.  jc42 binds where a sensor is
 populated.  i2cdetect scans in read mode.
 
+With Receive Byte in place the driver can also do what the other SMBus
+host drivers do and call i2c_register_spd() per adapter, so the SPD
+EEPROMs are instantiated at probe rather than by hand.  The helper counts
+the populated slots from DMI and probes upwards from 0x50, leaving alone
+any address that does not answer; each channel carries half the DIMMs and
+the scan is per adapter, so each finds its own.  Nothing else is
+instantiated, jc42 included: there is no firmware description of these
+buses and this driver does not scan for anything but the SPDs.
+
+I used the write_disable variant.  This part is DDR4 only, where the two
+are equivalent - the distinction gates spd5118 on DDR5 - and between two
+equivalent calls the one that does not read as "this driver enables SPD
+writes" seemed the better thing to leave in a memory-bus driver.  Happy
+to switch to write_enable for consistency with i801 and piix4 if you
+prefer the convention.
+
 SMBus Quick is still not implemented, and not only because the engine has
 no obvious encoding for it.  A write to the 0x30-0x37 range is how an
 EE1004 SPD is write-protected, permanently on many modules.  An adapter
@@ -156,6 +172,8 @@ Changes since v2
     not, ee1004 also needs Receive Byte and Send Byte.
   - Implement both, on the pointer-select bit, so ee1004 binds and
     decode-dimms works.
+  - Instantiate the SPD EEPROMs with i2c_register_spd() instead of
+    leaving it to the user.
 
 Validation
 ~~~~~~~~~~
@@ -170,11 +188,13 @@ Validation
     concurrent reads per channel, the default-off gate, and 20
     unload/reload cycles: 19 checks, 0 failures, no kernel warning or oops,
     no interference reported, every command word confirmed in the register.
-  - ee1004 bound on all four SPD addresses and decode-dimms decoded all
-    four modules, each with the CRC of bytes 0-125 and of bytes 128-253
-    valid.  The part number reads out of page 1, so the page select is
-    exercised end to end.  The four module serial numbers were identical
-    before and after every experiment in this series.
+  - i2c_register_spd() instantiated ee1004 on all four populated SPD
+    addresses at probe, two per channel, and claimed none of the empty
+    ones.  decode-dimms then decoded all four modules, each with the CRC
+    of bytes 0-125 and of bytes 128-253 valid.  The part number reads out
+    of page 1, so the page select is exercised end to end.  The four
+    module serial numbers were identical before and after every
+    experiment in this series.
   - Engine registers sampled every 2 s for one hour with the driver
     unloaded: 1791 samples, 0 changes.  No firmware activity while the
     system is up.
