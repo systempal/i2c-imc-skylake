@@ -156,8 +156,16 @@ i2cdetect -l | grep iMC
 ```
 
 ```text
-i2c-6   smbus           iMC SMBus Skylake-X channel 0                SMBus adapter
-i2c-7   smbus           iMC SMBus Skylake-X channel 1                SMBus adapter
+i2c-7   smbus           iMC SMBus Skylake-X channel 0                SMBus adapter
+i2c-8   smbus           iMC SMBus Skylake-X channel 1                SMBus adapter
+```
+
+Bus numbers are handed out in probe order, so they move between boots and
+kernels — the numbers above are what one machine happened to get, not fixed
+values. Take them from the command, not from this page:
+
+```bash
+CH0=$(i2cdetect -l | sed -n 's/^i2c-\([0-9]*\).*iMC SMBus.*channel 0.*/\1/p')
 ```
 
 The driver implements SMBus Receive Byte, Send Byte, BYTE_DATA and WORD_DATA.
@@ -165,22 +173,24 @@ SMBus Quick is deliberately not implemented (a write probe into `0x30`-`0x37`
 is how an EE1004 SPD is write-protected), so scan in read mode:
 
 ```bash
-sudo i2cdetect -y -r 6
+sudo i2cdetect -y -r "$CH0"
 ```
 
 SPD EEPROMs are instantiated automatically at probe (`ee1004`, counted from
-DMI), so `decode-dimms` works with no manual step. `ee1004` owns those
-addresses once bound: read the SPD through the driver, not with raw `i2cget`:
+DMI), so `decode-dimms` works with no manual step. Those addresses report as
+`UU` instead of as a number: a kernel driver owns them, which is the expected
+result and not a failed probe. Read the SPD through the driver, not with raw
+`i2cget`:
 
 ```bash
-sudo cat /sys/bus/i2c/devices/6-0050/eeprom | hexdump -C | head
+sudo cat "/sys/bus/i2c/devices/$CH0-0050/eeprom" | hexdump -C | head
 ```
 
 `jc42` is not instantiated (no firmware description of these buses); add it by
 hand where a thermal sensor is populated:
 
 ```bash
-echo jc42 0x18 | sudo tee /sys/bus/i2c/devices/i2c-6/new_device
+echo jc42 0x18 | sudo tee "/sys/bus/i2c/devices/i2c-$CH0/new_device"
 ```
 
 Read-only integration test against the module just built:
