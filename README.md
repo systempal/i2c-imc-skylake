@@ -1,7 +1,7 @@
 # Intel Skylake-X iMC SMBus I2C Driver
 
 [![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html)
-[![CI](https://github.com/systempal/i2c-imc-skylake/actions/workflows/ci.yml/badge.svg)](https://github.com/systempal/i2c-imc-skylake/actions/workflows/ci.yml)
+[![CI](https://github.com/systempal/i2c-imc-skylake/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/systempal/i2c-imc-skylake/actions/workflows/ci.yml?query=branch%3Amain)
 [![Upstream Status](https://img.shields.io/badge/Upstream-v2%20archived-orange.svg)](https://lore.kernel.org/linux-i2c/20260620144131.415559-1-simone.chifari@gmail.com/T/#t)
 
 An experimental Linux PCI driver for the SMBus engine in the integrated memory
@@ -31,7 +31,7 @@ Patch series v2 is archived on
 [lore.kernel.org](https://lore.kernel.org/linux-i2c/20260620144131.415559-1-simone.chifari@gmail.com/T/#t)
 and received no replies.
 
-The next posting is `[PATCH v4]`, a single patch. See
+The next posting is `[PATCH v3]`, a single patch. See
 [docs/submission/cover-letter.txt](docs/submission/cover-letter.txt).
 
 **No iMC I2C driver has ever been merged into mainline.** Andy Lutomirski's
@@ -43,7 +43,7 @@ either; it detects it. See the cover letter for what that means in practice.
 
 ## Retracted: the CF8/CFC claim
 
-Up to v3 this project claimed that firmware filters CF8/CFC config writes to
+The v2 posting claimed that firmware filters CF8/CFC config writes to
 the PCU function, and that the registers were reachable only through the
 memory-mapped window. **That was wrong.** It was never tested directly; the
 only evidence was a boot log line naming the access method.
@@ -143,7 +143,7 @@ This opt-in is intentionally not installed by the project.
 ```bash
 sudo apt-get install dkms
 sudo dkms add .
-sudo dkms install -m i2c-imc-skylake -v 1.0.0
+sudo dkms install -m i2c-imc-skylake -v "$(cat VERSION)"
 ```
 
 ---
@@ -159,19 +159,26 @@ i2c-6   smbus           iMC SMBus Skylake-X channel 0                SMBus adapt
 i2c-7   smbus           iMC SMBus Skylake-X channel 1                SMBus adapter
 ```
 
-The driver advertises SMBus BYTE_DATA and WORD_DATA only, so `i2cdetect` cannot
-scan the bus. Read a device directly — SPD byte 2 (DDR4 type code `0x0c`) from
-EEPROM `0x50` on channel 0:
+The driver implements SMBus Receive Byte, Send Byte, BYTE_DATA and WORD_DATA.
+SMBus Quick is deliberately not implemented (a write probe into `0x30`-`0x37`
+is how an EE1004 SPD is write-protected), so scan in read mode:
 
 ```bash
-sudo i2cget -y 6 0x50 0x02
+sudo i2cdetect -y -r 6
 ```
 
-The adapter does not instantiate `ee1004` or `jc42` clients. Check first that
-the address is not already bound, then:
+SPD EEPROMs are instantiated automatically at probe (`ee1004`, counted from
+DMI), so `decode-dimms` works with no manual step. `ee1004` owns those
+addresses once bound: read the SPD through the driver, not with raw `i2cget`:
 
 ```bash
-echo ee1004 0x50 | sudo tee /sys/bus/i2c/devices/i2c-6/new_device
+sudo cat /sys/bus/i2c/devices/6-0050/eeprom | hexdump -C | head
+```
+
+`jc42` is not instantiated (no firmware description of these buses); add it by
+hand where a thermal sensor is populated:
+
+```bash
 echo jc42 0x18 | sudo tee /sys/bus/i2c/devices/i2c-6/new_device
 ```
 
