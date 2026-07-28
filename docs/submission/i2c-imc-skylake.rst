@@ -112,8 +112,13 @@ read mode::
     $ i2cdetect -y -r 6
          0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f
     20: -- -- -- -- -- -- -- 27 -- -- -- -- -- -- -- --
-    30: 30 31 -- -- 34 35 36 -- -- -- -- -- -- -- -- --
-    50: 50 -- 52 -- -- -- -- -- -- -- -- -- -- -- -- --
+    30: 30 31 -- -- 34 35 UU UU -- -- -- -- -- -- -- --
+    50: UU -- UU -- -- -- -- -- -- -- -- -- -- -- -- --
+
+The ``UU`` entries are the addresses the driver claims at probe: the SPD
+EEPROMs at 0x50 and 0x52, and the page-select pair at 0x36 and 0x37 that
+``i2c_register_spd_write_disable()`` reserves so that nothing can write them.
+See "Instantiating clients" below.
 
 Not advertising Quick is deliberate as well as accurate.  A write to the
 0x30-0x37 range is how an EE1004 SPD is write-protected, permanently on many
