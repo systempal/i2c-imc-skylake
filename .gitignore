@@ -56,3 +56,6 @@ docs/submission/v4-review-360.md
 
 # Private Gitea CI (replaced by .github/workflows/ for public repo)
 .gitea/
+
+# Claude Code local settings (never public)
+.claude/

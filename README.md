@@ -2,7 +2,7 @@
 
 [![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html)
 [![CI](https://github.com/systempal/i2c-imc-skylake/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/systempal/i2c-imc-skylake/actions/workflows/ci.yml?query=branch%3Amain)
-[![Upstream Status](https://img.shields.io/badge/Upstream-v3%20ready%20to%20post-yellow.svg)](https://lore.kernel.org/linux-i2c/20260620144131.415559-1-simone.chifari@gmail.com/T/#t)
+[![Upstream Status](https://img.shields.io/badge/Upstream-v3%20posted-blue.svg)](https://lore.kernel.org/linux-i2c/20260728122423.358416-1-simone.chifari@gmail.com/T/#t)
 
 An experimental Linux PCI driver for the SMBus engine in the integrated memory
 controller (iMC) of Intel Skylake-X and Cascade Lake-X processors
@@ -27,12 +27,13 @@ without custom raw PCI writes.
 
 ## Upstream status
 
-Patch series v2 is archived on
+`[PATCH v3]`, a single patch, was posted on 2026-07-28:
+[lore.kernel.org](https://lore.kernel.org/linux-i2c/20260728122423.358416-1-simone.chifari@gmail.com/T/#t).
+See [docs/submission/cover-letter.txt](docs/submission/cover-letter.txt).
+
+v2 (posted as `i2c-imc-x299`) is archived on
 [lore.kernel.org](https://lore.kernel.org/linux-i2c/20260620144131.415559-1-simone.chifari@gmail.com/T/#t)
 and received no replies.
-
-The next posting is `[PATCH v3]`, a single patch. See
-[docs/submission/cover-letter.txt](docs/submission/cover-letter.txt).
 
 **No iMC I2C driver has ever been merged into mainline.** Andy Lutomirski's
 `i2c_imc` (2013-2016) and Stefan Schaeckeler's 2020 Broadwell rewrite both
