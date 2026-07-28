@@ -597,8 +597,12 @@ static int imc_check_firmware_polling(struct pci_dev *pdev)
 		for (i = 0; i < ARRAY_SIZE(imc_chans); i++) {
 			u32 cntl;
 
-			if (pci_read_config_dword(imc, IMC_SMBCNTL(i), &cntl))
+			if (pci_read_config_dword(imc, IMC_SMBCNTL(i), &cntl)) {
+				dev_warn(&pdev->dev,
+					 "%s ch%d SMBCNTL unreadable; cannot verify that TSOD polling is disabled\n",
+					 pci_name(imc), i);
 				continue;
+			}
 
 			if (cntl & SMBCNTL_TSOD_POLL_EN) {
 				dev_err(&pdev->dev,
