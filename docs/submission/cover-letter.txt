@@ -1,4 +1,4 @@
-Subject: [PATCH v5] i2c: imc-skylake: add Intel Skylake-X iMC SMBus adapter
+Subject: [PATCH v3] i2c: imc-skylake: add Intel Skylake-X iMC SMBus adapter
 
 The integrated memory controller of Intel Skylake-X and Cascade Lake-X
 processors contains an SMBus engine wired to the DDR4 DIMMs.  This driver
@@ -9,8 +9,6 @@ and lm-sensors.
 v2 was posted as i2c-imc-x299 and received no replies:
 
   https://lore.kernel.org/linux-i2c/20260620144131.415559-1-simone.chifari@gmail.com/
-
-v3 and v4 were never posted.
 
 Correction to v2
 ~~~~~~~~~~~~~~~~
