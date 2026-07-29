@@ -19,8 +19,11 @@ config I2C_IMC_SKYLAKE
 	  refuses to bind unless the allow_unsafe_access module parameter
 	  is enabled.  See Documentation/i2c/busses/i2c-imc-skylake.rst.
 
-	  If unsure, say N.  This driver is only useful on Intel X299 desktop
-	  / HEDT systems with the Skylake-X or Cascade Lake-X CPU.
+	  If unsure, say N.  This driver is aimed at Intel X299 desktop /
+	  HEDT systems with a Skylake-X or Cascade Lake-X CPU.  The same PCI
+	  ID appears on Skylake-SP / Cascade Lake-SP servers, where a BMC is
+	  far more likely to be using the engine already; the driver applies
+	  the same checks there, but saying N is even more advisable.
 
 	  This driver can also be built as a module.  If so, the module
 	  will be called i2c-imc-skylake.
