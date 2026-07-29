@@ -8,6 +8,10 @@ Supported adapters:
   * Intel Skylake-X / Cascade Lake-X integrated memory controller (iMC)
     SMBus engine, PCU function 8086:2085 (socket LGA 2066, platform X299)
 
+The same PCI ID appears on Skylake-SP / Cascade Lake-SP servers.  The driver
+behaves identically there, but on server boards a BMC is far more likely to be
+using the engine already; read the next section twice before opting in.
+
 Author: Simone Chifari <simone.chifari@gmail.com>
 
 
@@ -66,10 +70,14 @@ Per transfer:
   * the previous command state of both channels is saved, the TSOD-active
     state is cleared for the duration of the transfer, and both are restored
     afterwards;
-  * after each transfer the command registers are compared against what the
-    driver left in them.  A difference means another master used the engine,
-    and the transfer is failed with ``-EAGAIN`` rather than reported as
-    successful.
+  * the command word is read back and must be the one just written, in the
+    bits the driver produces; two identical consecutive commands are the
+    one case this cannot cover, because bit 29 cannot serve as a nonce -
+    the engine errors out any command with it clear;
+  * the result is read, and only then are the command registers compared
+    against what the driver left in them.  A difference means another master
+    used the engine, and the transfer is failed with ``-EAGAIN`` rather than
+    reported as successful.
 
 The last check is what makes an unarbitrated system detectable: if the log
 shows
@@ -78,6 +86,11 @@ shows
 
 then firmware is using the engine and the driver should not be loaded on that
 system.
+
+The TSOD-polling check runs again on resume from suspend, because firmware
+can enable the polling across a sleep state.  If it did, the adapters stay
+suspended and transfers fail with ``-ESHUTDOWN`` instead of racing the memory
+controller.
 
 
 Config space access

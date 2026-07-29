@@ -12,13 +12,13 @@
  *
  * Per-channel register triple within the config space of the function:
  *                  ch0     ch1
- *     CTRL (data)  0xB4    0xB8   write: data byte in bits[23:16]; read: low byte
- *     DATA (cmd)   0x9C    0xA0   command toggle | GO | address | register
+ *     CMD          0x9C    0xA0   command toggle | GO | address | register
+ *     DATA         0xB4    0xB8   write: data byte in bits[23:16]; read: low byte
  *     STATUS       0xA8    0xAC   bit0 BUSY, bit1 ERROR/NACK,
  *                                 bit2 READ_DONE, bit3 WRITE_DONE
- *   SMBus command byte (DATA bits[15:8]) = (rw << 7) | addr7: the 7-bit slave
+ *   SMBus command byte (CMD bits[15:8]) = (rw << 7) | addr7: the 7-bit slave
  *   address with bit7 = direction (1 write / 0 read).  The register/offset goes
- *   in DATA[7:0].  So 0x50 reads SPD EEPROM 0x50.  This was decoded and
+ *   in CMD[7:0].  So 0x50 reads SPD EEPROM 0x50.  This was decoded and
  *   confirmed on hardware, and cross-checked against an independent Windows
  *   implementation of the same engine.
  *
@@ -71,16 +71,20 @@
 #define SMBCNTL_TSOD_PRESENT	GENMASK(7, 0)
 
 /* per-channel register offsets in the function's config space */
-#define CH0_CTRL	0xB4
-#define CH0_DATA	0x9C
+#define CH0_CMD		0x9C
+#define CH0_DATA	0xB4
 #define CH0_STAT	0xA8
-#define CH1_CTRL	0xB8
-#define CH1_DATA	0xA0
+#define CH1_CMD		0xA0
+#define CH1_DATA	0xB8
 #define CH1_STAT	0xAC
 
 /*
- * Command word written to the DATA register:
- *   bit29       = command toggle
+ * Command word written to the CMD register:
+ *   bit29       = must be set for the engine to execute the command.
+ *                 Measured on hardware: with the bit clear, GO is consumed
+ *                 but the transaction completes with the error bit set, so
+ *                 it cannot serve as a per-command nonce (see
+ *                 imc_command_landed())
  *   bit20       = TSOD active state, preserved across transfers
  *   bit19       = GO
  *   bit17       = word transfer
@@ -88,7 +92,7 @@
  *                   rw bit (0x80): 1 = write, 0 = read
  *                   addr7        : 7-bit SMBus slave address
  *   bits[7:0]   = register/offset within the addressed device
- * For a write the data byte is latched into CTRL[23:16] beforehand.  This
+ * For a write the data byte is latched into DATA[23:16] beforehand.  This
  * encoding was confirmed on hardware: command 0x50 reads SPD EEPROM 0x50
  * (DDR4 signature).
  */
@@ -145,13 +149,13 @@ MODULE_PARM_DESC(allow_unsafe_access,
 		 "allow access without firmware/SMM arbitration (unsafe)");
 
 struct imc_chan {
-	unsigned int ctrl, data, stat;
+	unsigned int cmd, data, stat;
 	int idx;			/* channel index 0 or 1 */
 };
 
 static const struct imc_chan imc_chans[2] = {
-	{ CH0_CTRL, CH0_DATA, CH0_STAT, 0 },
-	{ CH1_CTRL, CH1_DATA, CH1_STAT, 1 },
+	{ CH0_CMD, CH0_DATA, CH0_STAT, 0 },
+	{ CH1_CMD, CH1_DATA, CH1_STAT, 1 },
 };
 
 /* one driver state object, shared by both per-channel adapters */
@@ -167,6 +171,7 @@ struct imc_smbus {
 struct imc_xfer_state {
 	u32 command[ARRAY_SIZE(imc_chans)];
 	bool restore[ARRAY_SIZE(imc_chans)];
+	u32 readback;			/* own channel's CMD just after our write */
 };
 
 /*
@@ -230,7 +235,7 @@ static int imc_wait_go_clear(struct imc_smbus *s, const struct imc_chan *c)
 
 	return read_poll_timeout(imc_reg, val, !(val & GO_BIT) || s->io_err,
 				 IMC_POLL_US, IMC_GO_TIMEOUT_US, false,
-				 s, c->data);
+				 s, c->cmd);
 }
 
 static int imc_wait_done(struct imc_smbus *s, const struct imc_chan *c,
@@ -265,8 +270,8 @@ static int imc_wait_transfer(struct imc_smbus *s, const struct imc_chan *c,
 	if (!(*status & STAT_BUSY) || (*status & STAT_ANY_DONE))
 		return ret;
 
-	command = imc_reg(s, c->data);
-	imc_set(s, c->data, command ^ COMMAND_TOGGLE);
+	command = imc_reg(s, c->cmd);
+	imc_set(s, c->cmd, command ^ COMMAND_TOGGLE);
 
 	ret = imc_wait_done(s, c, status);
 	if (ret)
@@ -304,23 +309,36 @@ static int imc_check_status(struct imc_smbus *s, const struct imc_chan *c,
  * command word is already clear, and the caller would receive the previous
  * transaction's data as valid.
  *
- * Read the command word back and require it to be the one just written.  The
- * engine only ever clears GO, so that bit is the single permitted difference;
- * anything else means the write did not land.  Checking the word rather than
- * a status transition matters because two identical transfers in a row leave
- * STATUS bit for bit the same.
+ * Read the command word back and require it to be the one just written, in
+ * every bit this driver produces except GO, which the engine clears itself.
+ * Checking the word rather than a status transition matters because two
+ * identical transfers in a row leave STATUS bit for bit the same.
+ *
+ * Known residual blind spot: those two identical transfers also leave CMD
+ * identical except for GO, so a command write dropped between them cannot be
+ * told from the stale word.  Bit 29 would be the natural per-command nonce,
+ * but the engine refuses it: measured on hardware, a command with bit 29
+ * clear consumes GO and completes with the error bit set.  Any dropped
+ * write between two commands that differ in address, register, direction or
+ * size is caught.
+ *
+ * Bits outside COMMAND_OUR_BITS are not compared; whether the hardware
+ * preserves or clears them is its own business.
  */
 static bool imc_command_landed(u32 command, u32 readback)
 {
-	return !((command ^ readback) & ~GO_BIT);
+	return !((command ^ readback) & COMMAND_OUR_BITS & ~GO_BIT);
 }
 
 /*
  * Detect a second master.  Compare the command registers against what this
- * driver left in them: for the channel it drove, only the bits it does not own;
- * for the other channel, all of them.  A difference means firmware, a BMC or
- * CLTT touched the engine while the transfer was in flight, so the result
- * cannot be trusted.
+ * driver left in them: for the channel it drove, only the bits it does not
+ * own, with the read-back taken right after the command write as the
+ * baseline, so a hardware bit that is simply preserved across our write does
+ * not read as interference; for the other channel, all bits, against the
+ * saved pre-transfer word.  A difference means firmware, a BMC or CLTT
+ * touched the engine while the transfer was in flight, so the result cannot
+ * be trusted.
  */
 static int imc_check_interference(struct imc_smbus *s, const struct imc_chan *c,
 				  const struct imc_xfer_state *state)
@@ -328,9 +346,10 @@ static int imc_check_interference(struct imc_smbus *s, const struct imc_chan *c,
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(imc_chans); i++) {
-		u32 mask = i == c->idx ? ~COMMAND_OUR_BITS : ~0U;
-		u32 expect = state->command[i] & COMMAND_KEEP_MASK;
-		u32 now = imc_reg(s, imc_chans[i].data);
+		u32 mask = i == c->idx ? (u32)~COMMAND_OUR_BITS : ~0U;
+		u32 expect = i == c->idx ? state->readback :
+			     state->command[i] & COMMAND_KEEP_MASK;
+		u32 now = imc_reg(s, imc_chans[i].cmd);
 
 		if (!((now ^ expect) & mask))
 			continue;
@@ -357,7 +376,7 @@ static void imc_restore_xfer(struct imc_smbus *s,
 		 * address, register and TSOD state back, never to re-arm a
 		 * transaction that was already in flight when we found it.
 		 */
-		imc_set(s, imc_chans[i].data, state->command[i] & ~GO_BIT);
+		imc_set(s, imc_chans[i].cmd, state->command[i] & ~GO_BIT);
 	}
 }
 
@@ -371,13 +390,22 @@ static int imc_prepare_xfer(struct imc_smbus *s, const struct imc_chan *c,
 		return ret;
 
 	for (i = 0; i < ARRAY_SIZE(imc_chans); i++) {
-		state->command[i] = imc_reg(s, imc_chans[i].data);
+		state->command[i] = imc_reg(s, imc_chans[i].cmd);
+		/*
+		 * A failed read makes the saved word garbage; stop before
+		 * writing it anywhere.  Channels already modified by earlier
+		 * iterations are restored.
+		 */
+		if (s->io_err) {
+			imc_restore_xfer(s, state);
+			return s->io_err;
+		}
 		state->restore[i] = i == c->idx ||
 				    (state->command[i] & TSOD_ACTIVE_BIT);
 		if (!(state->command[i] & TSOD_ACTIVE_BIT))
 			continue;
 
-		imc_set(s, imc_chans[i].data,
+		imc_set(s, imc_chans[i].cmd,
 			state->command[i] & COMMAND_KEEP_MASK);
 		ret = imc_wait_go_clear(s, &imc_chans[i]);
 		if (ret) {
@@ -408,12 +436,12 @@ static int imc_access(struct imc_smbus *s, const struct imc_chan *c, u8 addr,
 
 	if (read_write == I2C_SMBUS_WRITE) {
 		raw = size == I2C_SMBUS_WORD_DATA ? swab16(*value) : *value;
-		imc_set(s, c->ctrl, raw << 16);
+		imc_set(s, c->data, raw << 16);
 		command |= WRITE_OPERATION;
 	}
 
-	imc_set(s, c->data, command);
-	readback = imc_reg(s, c->data);
+	imc_set(s, c->cmd, command);
+	readback = imc_reg(s, c->cmd);
 	if (!imc_command_landed(command, readback)) {
 		dev_warn_ratelimited(s->dev,
 				     "ch%d command 0x%08x did not reach the register (read back 0x%08x)\n",
@@ -421,6 +449,7 @@ static int imc_access(struct imc_smbus *s, const struct imc_chan *c, u8 addr,
 		ret = -EIO;
 		goto restore_command;
 	}
+	state.readback = readback;
 
 	ret = imc_wait_transfer(s, c, &status);
 	if (ret)
@@ -432,15 +461,18 @@ static int imc_access(struct imc_smbus *s, const struct imc_chan *c, u8 addr,
 	if (ret)
 		goto restore_command;
 
-	ret = imc_check_interference(s, c, &state);
-	if (ret)
-		goto restore_command;
-
 	if (read_write == I2C_SMBUS_READ) {
-		raw = imc_reg(s, c->ctrl);
+		raw = imc_reg(s, c->data);
 		*value = size == I2C_SMBUS_WORD_DATA ?
 			 swab16(raw & 0xffff) : raw & 0xff;
 	}
+
+	/*
+	 * Last, so that it covers the data read above as well: a foreign
+	 * transaction squeezed between the completion and the data read
+	 * would have replaced the command word and is caught here.
+	 */
+	ret = imc_check_interference(s, c, &state);
 
 restore_command:
 	imc_restore_xfer(s, &state);
@@ -553,30 +585,6 @@ static const struct i2c_algorithm imc_algo = {
 	.functionality	= imc_func,
 };
 
-static int imc_suspend(struct device *dev)
-{
-	struct imc_smbus *s = dev_get_drvdata(dev);
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(s->adap); i++)
-		i2c_mark_adapter_suspended(&s->adap[i]);
-
-	return 0;
-}
-
-static int imc_resume(struct device *dev)
-{
-	struct imc_smbus *s = dev_get_drvdata(dev);
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(s->adap); i++)
-		i2c_mark_adapter_resumed(&s->adap[i]);
-
-	return 0;
-}
-
-static DEFINE_SIMPLE_DEV_PM_OPS(imc_pm_ops, imc_suspend, imc_resume);
-
 /*
  * Refuse to share the engine with the memory controller's own thermal
  * throttling.  SMBCNTL.TSOD_POLL_EN tells us directly whether the iMC is
@@ -625,6 +633,44 @@ static int imc_check_firmware_polling(struct pci_dev *pdev)
 
 	return 0;
 }
+
+static int imc_suspend(struct device *dev)
+{
+	struct imc_smbus *s = dev_get_drvdata(dev);
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(s->adap); i++)
+		i2c_mark_adapter_suspended(&s->adap[i]);
+
+	return 0;
+}
+
+static int imc_resume(struct device *dev)
+{
+	struct imc_smbus *s = dev_get_drvdata(dev);
+	int i;
+
+	/*
+	 * Firmware demonstrably drives the engine across suspend (an SPD
+	 * read during memory training was observed on resume from S3), and
+	 * it may also leave TSOD polling enabled, a state the probe-time
+	 * check can no longer refuse.  Re-check, and keep the adapters
+	 * suspended when the engine is no longer ours: transfers then fail
+	 * with -ESHUTDOWN instead of racing the memory controller.
+	 */
+	if (imc_check_firmware_polling(s->pdev)) {
+		dev_err(s->dev,
+			"TSOD polling was enabled while suspended; adapters stay disabled\n");
+		return 0;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(s->adap); i++)
+		i2c_mark_adapter_resumed(&s->adap[i]);
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(imc_pm_ops, imc_suspend, imc_resume);
 
 static int imc_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
