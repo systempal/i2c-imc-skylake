@@ -1,4 +1,8 @@
-Subject: [PATCH v3] i2c: imc-skylake: add Intel Skylake-X iMC SMBus adapter
+Subject: [PATCH v4] i2c: imc-skylake: add Intel Skylake-X iMC SMBus adapter
+
+(DRAFT for v4.  Toggle probe ran 2026-07-28: the engine refuses bit-29
+polarity 0 - GO consumed, error bit set, 8/8.  Alternation reverted; the
+limitation is documented at the check instead.)
 
 The integrated memory controller of Intel Skylake-X and Cascade Lake-X
 processors contains an SMBus engine wired to the DDR4 DIMMs.  This driver
@@ -9,6 +13,10 @@ and lm-sensors.
 v2 was posted as i2c-imc-x299 and received no replies:
 
   https://lore.kernel.org/linux-i2c/20260620144131.415559-1-simone.chifari@gmail.com/
+
+v3:
+
+  https://lore.kernel.org/linux-i2c/20260728122423.358416-1-simone.chifari@gmail.com/
 
 Correction to v2
 ~~~~~~~~~~~~~~~~
@@ -69,8 +77,17 @@ So this driver:
     READ_DONE and WRITE_DONE both still set from an earlier transaction.
     Without the check, a command word that never reaches the register is
     indistinguishable from a completed transfer and the caller receives the
-    previous transaction's data.  The engine only ever clears GO, so that
-    is the single permitted difference between the two words.
+    previous transaction's data.  The comparison covers the bits the
+    driver produces, minus GO, which the engine clears itself;
+  - documents the one case the read-back check cannot see: two
+    consecutive, identical commands - the shape of an ee1004 Receive Byte
+    stream - leave the same word in the register, so a command write
+    dropped between them is invisible.  Bit 29 would be the natural
+    per-command nonce, but the engine refuses it: measured on this
+    system, a command with bit 29 clear consumes GO and completes with
+    the error bit set, on reads that succeed with the bit set.  Every
+    dropped write between commands that differ in address, register,
+    direction or size is caught.
 
   - refuses to bind when the memory controller is polling the DIMM thermal
     sensors itself.  Intel documents SMBCNTL on the iMC channel function
@@ -119,8 +136,11 @@ Byte to the DDR4 page-select addresses moves the 256-byte window: byte
 to it after selecting page 0.
 
 ee1004 consequently binds, and decode-dimms reads all four DIMMs on this
-system with both SPD CRCs valid on each.  jc42 binds where a sensor is
-populated.  i2cdetect scans in read mode.
+system with both SPD CRCs valid on each.  i2cdetect scans in read mode.
+jc42 needs only BYTE_DATA and WORD_DATA reads, which are implemented and
+validated against the SPDs; jc42 itself has not been exercised, because no
+DIMM on the test system populates a thermal sensor (TSOD_PRESENT reads
+0x00).
 
 With Receive Byte in place the driver can also do what the other SMBus
 host drivers do and call i2c_register_spd() per adapter, so the SPD
@@ -142,6 +162,50 @@ SMBus Quick is still not implemented, and not only because the engine has
 no obvious encoding for it.  A write to the 0x30-0x37 range is how an
 EE1004 SPD is write-protected, permanently on many modules.  An adapter
 whose bus is the memory bus should not advertise a probe that writes.
+
+Changes since v3
+~~~~~~~~~~~~~~~~
+All of these came out of a self-review of v3; none changes what the driver
+supports.
+
+  - Self-review found the read-back check blind for two identical
+    commands in a row - precisely the shape of an ee1004 Receive Byte
+    stream.  The obvious fix, alternating bit 29 per command, was
+    implemented and then reverted after measurement: the engine consumes
+    GO but sets the error bit for every command with bit 29 clear, so
+    the bit cannot serve as a nonce.  The limitation is now documented
+    at the check instead of silently present.
+  - Compare only the bits the driver produces in the read-back check, and
+    use the post-write read-back, not the pre-transfer word, as the
+    baseline for the interference check on the driven channel.  v3
+    implicitly required every undocumented bit of the command register to
+    read as zero, which held on the test system but is not something to
+    assume across steppings.
+  - Read the result before the interference check, not after, so the check
+    also covers the window in which the data latch is read.
+  - Re-run the TSOD-polling check on resume and keep the adapters
+    suspended if firmware enabled it across suspend; the probe-time
+    refusal alone cannot see that.  The S3 observation below is exactly
+    the scenario that motivates this.
+  - Stop before writing a saved command word back if the config read that
+    fetched it had already failed.
+  - Rename the register accessors: the command register is now CMD and
+    the data latch DATA.  v3 called the command register DATA and the
+    data latch CTRL, which read backwards.
+  - State plainly that jc42 itself has not been run (no TSOD populated
+    here), only the transactions it needs.
+  - Note that PCI ID 8086:2085 also matches Skylake-SP/Cascade Lake-SP
+    servers, where a BMC is far more likely to own the engine; the gate,
+    the SMBCNTL refusal and the interference detection are the same, but
+    the audience of the warning is different.
+  - Correct a stale function name in the v3 cover letter:
+    imc_engine_responded() is imc_command_landed() in the code as posted.
+  - Cast ~COMMAND_OUR_BITS to u32 in the interference check; BIT() and
+    GENMASK() are unsigned long, so the complement was computed in 64
+    bits and truncated on assignment.  The truncated value was already
+    correct; this silences a clang W=1 -Wconstant-conversion warning.
+    Reported-by: kernel test robot <lkp@intel.com>
+    Closes: https://lore.kernel.org/oe-kbuild-all/202607291626.TnSyWh0f-lkp@intel.com/
 
 Changes since v2
 ~~~~~~~~~~~~~~~~
@@ -251,7 +315,7 @@ with an AI coding assistant, run interactively rather than autonomously.
     response to specific requests, not from a single generating prompt.  A
     representative request is "the done bits are latched; show me how a
     command that is never accepted can be mistaken for a completed one, and
-    make that case detectable", which produced imc_engine_responded().  It
+    make that case detectable", which produced imc_command_landed().  It
     also designed the measurement that retracted the CF8/CFC claim above,
     after asking why that claim had never been tested directly.
   - Testing: every revision was built with W=1, checked with
