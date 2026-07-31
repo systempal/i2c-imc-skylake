@@ -166,6 +166,7 @@ struct imc_smbus {
 					/* needed: both channels share one engine */
 	struct i2c_adapter adap[2];	/* one per hardware channel */
 	int io_err;			/* sticky config-access error, under lock */
+	u32 boot_cmd[ARRAY_SIZE(imc_chans)];	/* pristine CMD words, see probe */
 };
 
 struct imc_xfer_state {
@@ -664,6 +665,28 @@ static int imc_resume(struct device *dev)
 		return 0;
 	}
 
+	/*
+	 * The firmware demonstrably uses the engine across suspend (see
+	 * above), so the boot-time snapshot may no longer be the state it
+	 * expects to find at shutdown.  Take a fresh one.  If it cannot be
+	 * read the adapters stay suspended, exactly as after a failed
+	 * re-check: an unreadable snapshot would make the shutdown handback
+	 * write garbage.
+	 */
+	mutex_lock(&s->lock);
+	s->io_err = 0;
+	for (i = 0; i < ARRAY_SIZE(imc_chans); i++)
+		s->boot_cmd[i] = imc_reg(s, imc_chans[i].cmd);
+	if (s->io_err) {
+		mutex_unlock(&s->lock);
+		dev_err(s->dev,
+			"cannot refresh the engine snapshot; adapters stay disabled\n");
+		return 0;
+	}
+	dev_dbg(s->dev, "snapshot refreshed on resume: ch0 0x%08x ch1 0x%08x\n",
+		s->boot_cmd[0], s->boot_cmd[1]);
+	mutex_unlock(&s->lock);
+
 	for (i = 0; i < ARRAY_SIZE(s->adap); i++)
 		i2c_mark_adapter_resumed(&s->adap[i]);
 
@@ -671,6 +694,44 @@ static int imc_resume(struct device *dev)
 }
 
 static DEFINE_SIMPLE_DEV_PM_OPS(imc_pm_ops, imc_suspend, imc_resume);
+
+/*
+ * Hand the engine back to the firmware.  After this point the next master is
+ * the BIOS - its S5/SMI path and the next boot - and it should find the
+ * command registers as it left them, not holding this driver's last transfer.
+ * Best effort by design: at shutdown there is nobody left to report an error
+ * to, so a failure only shortens the sequence, it never blocks the power-off.
+ * The same callback covers kexec, where the "next boot" starts without a
+ * firmware pass to reset the engine.
+ */
+static void imc_pci_shutdown(struct pci_dev *pdev)
+{
+	struct imc_smbus *s = pci_get_drvdata(pdev);
+	int i;
+
+	/* probe never completed: the engine was not touched, leave it alone */
+	if (!s)
+		return;
+
+	/* refuse new transfers, then drain the one possibly in flight */
+	for (i = 0; i < ARRAY_SIZE(s->adap); i++)
+		i2c_mark_adapter_suspended(&s->adap[i]);
+
+	mutex_lock(&s->lock);
+	s->io_err = 0;
+	imc_wait_engine_idle(s);
+
+	/*
+	 * GO masked for the same reason as in imc_restore_xfer(): put the
+	 * boot-time address, register and TSOD state back without re-arming
+	 * a transaction.
+	 */
+	for (i = 0; i < ARRAY_SIZE(imc_chans); i++)
+		imc_set(s, imc_chans[i].cmd, s->boot_cmd[i] & ~GO_BIT);
+	mutex_unlock(&s->lock);
+
+	dev_dbg(&pdev->dev, "engine quiesced for shutdown\n");
+}
 
 static int imc_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
@@ -702,6 +763,18 @@ static int imc_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	ret = devm_mutex_init(&pdev->dev, &s->lock);
 	if (ret)
 		return ret;
+
+	/*
+	 * Pristine command words: the state the firmware left in the engine at
+	 * boot, captured before this driver's first transfer.  They are handed
+	 * back in imc_pci_shutdown(), so an unreadable word would turn that
+	 * handback into writing garbage; fail the probe instead.
+	 */
+	for (i = 0; i < ARRAY_SIZE(imc_chans); i++)
+		s->boot_cmd[i] = imc_reg(s, imc_chans[i].cmd);
+	if (s->io_err)
+		return dev_err_probe(&pdev->dev, s->io_err,
+				     "cannot snapshot the engine command words\n");
 
 	/*
 	 * Lifetime safety: the I2C core guarantees that smbus_xfer callbacks
@@ -762,15 +835,25 @@ MODULE_DEVICE_TABLE(pci, imc_pci_ids);
 /*
  * All resources (mutex, i2c adapters) are devm-managed and are released
  * automatically after probe returns or during device unbinding, so no .remove
- * callback is needed.  The register state is deliberately left as-is on
- * unbind: the engine carries no driver-private latched state that needs
- * teardown, and the SMBus controls we drive are side-band registers the rest
- * of the kernel does not touch.
+ * callback is needed.  What happens to the register state depends on who
+ * comes next:
+ *
+ *  - On unbind with the OS running, it is deliberately left as-is.  The
+ *    engine carries no driver-private latched state that needs teardown, the
+ *    SMBus controls we drive are side-band registers the rest of the kernel
+ *    does not touch, and the next user is another instance of this driver,
+ *    which snapshots whatever it finds.
+ *
+ *  - On shutdown and kexec the next user is the firmware, which shares the
+ *    engine with this driver (see the header comment) and did not sign up
+ *    for finding it in mid-session state.  imc_pci_shutdown() hands it back
+ *    quiesced, with the command words as the firmware left them.
  */
 static struct pci_driver imc_driver = {
 	.name     = "i2c-imc-skylake",
 	.id_table = imc_pci_ids,
 	.probe    = imc_pci_probe,
+	.shutdown = imc_pci_shutdown,
 	.driver.pm = pm_sleep_ptr(&imc_pm_ops),
 };
 module_pci_driver(imc_driver);
