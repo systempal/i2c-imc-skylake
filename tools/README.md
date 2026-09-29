@@ -1,11 +1,12 @@
-# Hardware measurements still owed to the submission
+# Hardware measurements for the submission
 
 Three scripts, meant to be run by hand on an X299 (or Cascade Lake-X) system
 with the PCU function `8086:2085`. None of them is run by CI and none is run by
 `make test`.
 
 Output of all three belongs in the cover letter or in a reply on the list, as
-raw numbers. Do not paraphrase them.
+raw numbers. Do not paraphrase them. Results from more boards are wanted: what
+the v4 cover letter reports comes from a single system.
 
 | Script | Answers | Writes to hardware |
 | --- | --- | --- |
@@ -27,6 +28,10 @@ What the cover letter needs: a run of at least one hour, ideally across a
 suspend/resume cycle, with the observed change count. A non-zero count on a
 system means the driver must not be loaded there, and is itself a result worth
 reporting.
+
+Done on one board for v4: one hour at a 2 s interval with the driver unloaded,
+1791 samples, 0 changes (see the v4 cover letter). Runs on other boards and
+BIOSes are still wanted.
 
 ## 2. `dump-pcu-config.sh` — register survey (read-only)
 
